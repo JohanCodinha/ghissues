@@ -98,14 +98,18 @@ type FS struct {
 	repo       string
 	mountpoint string
 	server     *fuse.Server
+	onDirty    func() // called when an issue is marked dirty
 }
 
 // NewFS creates a new FUSE filesystem instance.
-func NewFS(cacheDB *cache.DB, repo, mountpoint string) *FS {
+// The onDirty callback is called whenever an issue is marked dirty in the cache.
+// Pass nil if no callback is needed.
+func NewFS(cacheDB *cache.DB, repo, mountpoint string, onDirty func()) *FS {
 	return &FS{
 		cache:      cacheDB,
 		repo:       repo,
 		mountpoint: mountpoint,
+		onDirty:    onDirty,
 	}
 }
 
@@ -114,8 +118,9 @@ func NewFS(cacheDB *cache.DB, repo, mountpoint string) *FS {
 func (f *FS) Mount() error {
 	// Create the root node
 	root := &rootNode{
-		cache: f.cache,
-		repo:  f.repo,
+		cache:   f.cache,
+		repo:    f.repo,
+		onDirty: f.onDirty,
 	}
 
 	// Create FUSE server options
@@ -166,8 +171,9 @@ func (f *FS) Unmount() error {
 // It implements fs.InodeEmbedder and fs.NodeReaddirer.
 type rootNode struct {
 	fs.Inode
-	cache *cache.DB
-	repo  string
+	cache   *cache.DB
+	repo    string
+	onDirty func()
 }
 
 var _ = (fs.NodeReaddirer)((*rootNode)(nil))
@@ -221,9 +227,10 @@ func (r *rootNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) 
 
 	// Create the file node
 	fileNode := &issueFileNode{
-		cache:  r.cache,
-		repo:   r.repo,
-		number: issue.Number,
+		cache:   r.cache,
+		repo:    r.repo,
+		number:  issue.Number,
+		onDirty: r.onDirty,
 	}
 
 	// Create a stable inode using the issue number
@@ -239,9 +246,10 @@ func (r *rootNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) 
 // issueFileNode represents a single issue file.
 type issueFileNode struct {
 	fs.Inode
-	cache  *cache.DB
-	repo   string
-	number int
+	cache   *cache.DB
+	repo    string
+	number  int
+	onDirty func()
 }
 
 var _ = (fs.NodeGetattrer)((*issueFileNode)(nil))
@@ -328,6 +336,7 @@ func (f *issueFileNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, 
 		number:  f.number,
 		buffer:  []byte(content),
 		dirty:   false,
+		onDirty: f.onDirty,
 	}
 
 	return handle, fuse.FOPEN_DIRECT_IO, 0
@@ -430,6 +439,10 @@ func (f *issueFileNode) Flush(ctx context.Context, fh fs.FileHandle) syscall.Err
 		if err != nil {
 			return syscall.EIO
 		}
+		// Trigger sync engine callback if set
+		if handle.onDirty != nil {
+			handle.onDirty()
+		}
 	}
 
 	handle.dirty = false
@@ -438,12 +451,13 @@ func (f *issueFileNode) Flush(ctx context.Context, fh fs.FileHandle) syscall.Err
 
 // issueFileHandle represents an open file handle for an issue.
 type issueFileHandle struct {
-	cache  *cache.DB
-	repo   string
-	number int
-	buffer []byte
-	dirty  bool
-	mu     sync.Mutex
+	cache   *cache.DB
+	repo    string
+	number  int
+	buffer  []byte
+	dirty   bool
+	onDirty func()
+	mu      sync.Mutex
 }
 
 var _ = (fs.FileHandle)((*issueFileHandle)(nil))
