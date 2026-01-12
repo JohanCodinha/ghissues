@@ -1,5 +1,5 @@
 # Binaries
-ghissues
+/ghissues
 *.exe
 *.dll
 *.so
