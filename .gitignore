@@ -1,0 +1,35 @@
+# Binaries
+ghissues
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Output of go coverage
+*.out
+
+# Go workspace
+go.work
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# SQLite
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Mount points (don't commit test mounts)
+/mnt/
+/test-mount/
+
+# OS
+.DS_Store
+Thumbs.db
