@@ -271,3 +271,52 @@ func (c *Client) UpdateIssue(owner, repo string, number int, body string) error 
 
 	return nil
 }
+
+// GetIssueWithEtag fetches an issue using a conditional request with etag.
+// Returns (nil, "", nil) on 304 Not Modified.
+// Returns (*Issue, newEtag, nil) on 200 OK with new data.
+func (c *Client) GetIssueWithEtag(owner, repo string, number int, etag string) (*Issue, string, error) {
+	url := fmt.Sprintf("%s/repos/%s/%s/issues/%d", apiBaseURL, owner, repo, number)
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+
+	// Add conditional request header
+	if etag != "" {
+		req.Header.Set("If-None-Match", etag)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, "", fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	checkRateLimit(resp)
+
+	// 304 Not Modified - issue hasn't changed
+	if resp.StatusCode == http.StatusNotModified {
+		return nil, "", nil
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, "", fmt.Errorf("GitHub API error: %s - %s", resp.Status, string(body))
+	}
+
+	var issue Issue
+	if err := json.NewDecoder(resp.Body).Decode(&issue); err != nil {
+		return nil, "", fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	newEtag := resp.Header.Get("ETag")
+	issue.ETag = newEtag
+
+	return &issue, newEtag, nil
+}

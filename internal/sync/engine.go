@@ -1,30 +1,320 @@
 // Package sync provides the synchronization engine between local cache and GitHub.
 package sync
 
-// Engine manages synchronization between the local cache and GitHub.
+import (
+	"fmt"
+	"log"
+	"strings"
+	gosync "sync"
+	"time"
+
+	"github.com/JohanCodinha/ghissues/internal/cache"
+	"github.com/JohanCodinha/ghissues/internal/gh"
+)
+
+// Engine handles synchronization between cache and GitHub.
 type Engine struct {
-	repo string
+	cache      *cache.DB
+	client     *gh.Client
+	repo       string // "owner/repo"
+	owner      string
+	repoName   string
+	debounceMs int
+
+	// internal state
+	mu     gosync.Mutex
+	timer  *time.Timer
+	stopCh chan struct{}
 }
 
-// New creates a new sync engine.
-func New(repo string) *Engine {
-	return &Engine{repo: repo}
+// NewEngine creates a new sync engine.
+// repo should be in "owner/repo" format.
+// debounceMs is the debounce delay in milliseconds for write syncs.
+func NewEngine(cacheDB *cache.DB, client *gh.Client, repo string, debounceMs int) (*Engine, error) {
+	owner, repoName, err := parseRepo(repo)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Engine{
+		cache:      cacheDB,
+		client:     client,
+		repo:       repo,
+		owner:      owner,
+		repoName:   repoName,
+		debounceMs: debounceMs,
+		stopCh:     make(chan struct{}),
+	}, nil
 }
 
-// Start starts the background sync engine.
-func (e *Engine) Start() error {
-	// TODO: Implement background sync
+// parseRepo splits "owner/repo" into owner and repo name.
+func parseRepo(repo string) (string, string, error) {
+	parts := strings.SplitN(repo, "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", fmt.Errorf("invalid repo format %q: must be owner/repo", repo)
+	}
+	return parts[0], parts[1], nil
+}
+
+// InitialSync fetches all issues from GitHub and populates the cache.
+// This should be called on mount.
+func (e *Engine) InitialSync() error {
+	log.Printf("sync: starting initial sync for %s", e.repo)
+
+	issues, err := e.client.ListIssues(e.owner, e.repoName)
+	if err != nil {
+		return fmt.Errorf("failed to list issues: %w", err)
+	}
+
+	log.Printf("sync: fetched %d issues from GitHub", len(issues))
+
+	for _, ghIssue := range issues {
+		// Convert labels to string slice
+		labels := make([]string, len(ghIssue.Labels))
+		for i, l := range ghIssue.Labels {
+			labels[i] = l.Name
+		}
+
+		cacheIssue := cache.Issue{
+			Number:    ghIssue.Number,
+			Repo:      e.repo,
+			Title:     ghIssue.Title,
+			Body:      ghIssue.Body,
+			State:     ghIssue.State,
+			Author:    ghIssue.User.Login,
+			Labels:    labels,
+			CreatedAt: ghIssue.CreatedAt.Format(time.RFC3339),
+			UpdatedAt: ghIssue.UpdatedAt.Format(time.RFC3339),
+			ETag:      ghIssue.ETag,
+			Dirty:     false,
+		}
+
+		if err := e.cache.UpsertIssue(cacheIssue); err != nil {
+			log.Printf("sync: failed to upsert issue #%d: %v", ghIssue.Number, err)
+			// Continue with other issues
+		}
+	}
+
+	log.Printf("sync: initial sync complete")
 	return nil
 }
 
-// Stop stops the sync engine and flushes pending changes.
-func (e *Engine) Stop() error {
-	// TODO: Implement sync stop and flush
+// RefreshIssue fetches a single issue if the etag has changed (background refresh).
+// Returns true if the issue was updated in cache, false if unchanged or error.
+// This uses conditional requests with If-None-Match header.
+func (e *Engine) RefreshIssue(number int) (bool, error) {
+	// Get the current cached issue to get its etag
+	cachedIssue, err := e.cache.GetIssue(e.repo, number)
+	if err != nil {
+		return false, fmt.Errorf("failed to get cached issue: %w", err)
+	}
+	if cachedIssue == nil {
+		return false, fmt.Errorf("issue #%d not found in cache", number)
+	}
+
+	// Don't refresh dirty issues - local changes take precedence
+	if cachedIssue.Dirty {
+		log.Printf("sync: skipping refresh for dirty issue #%d", number)
+		return false, nil
+	}
+
+	// Fetch with etag for conditional request
+	ghIssue, newEtag, err := e.client.GetIssueWithEtag(e.owner, e.repoName, number, cachedIssue.ETag)
+	if err != nil {
+		return false, fmt.Errorf("failed to fetch issue: %w", err)
+	}
+
+	// 304 Not Modified - issue hasn't changed
+	if ghIssue == nil {
+		return false, nil
+	}
+
+	// Issue was updated - update cache
+	labels := make([]string, len(ghIssue.Labels))
+	for i, l := range ghIssue.Labels {
+		labels[i] = l.Name
+	}
+
+	cacheIssue := cache.Issue{
+		Number:    ghIssue.Number,
+		Repo:      e.repo,
+		Title:     ghIssue.Title,
+		Body:      ghIssue.Body,
+		State:     ghIssue.State,
+		Author:    ghIssue.User.Login,
+		Labels:    labels,
+		CreatedAt: ghIssue.CreatedAt.Format(time.RFC3339),
+		UpdatedAt: ghIssue.UpdatedAt.Format(time.RFC3339),
+		ETag:      newEtag,
+		Dirty:     false,
+	}
+
+	if err := e.cache.UpsertIssue(cacheIssue); err != nil {
+		return false, fmt.Errorf("failed to update cache: %w", err)
+	}
+
+	log.Printf("sync: refreshed issue #%d from GitHub", number)
+	return true, nil
+}
+
+// TriggerSync schedules a debounced sync of dirty issues.
+// Multiple calls within the debounce window reset the timer.
+func (e *Engine) TriggerSync() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	// Stop existing timer if any
+	if e.timer != nil {
+		e.timer.Stop()
+	}
+
+	// Start new timer
+	e.timer = time.AfterFunc(time.Duration(e.debounceMs)*time.Millisecond, func() {
+		if err := e.syncDirtyIssues(); err != nil {
+			log.Printf("sync: error syncing dirty issues: %v", err)
+		}
+	})
+
+	log.Printf("sync: debounce timer started/reset (%dms)", e.debounceMs)
+}
+
+// SyncNow immediately syncs all dirty issues.
+// This should be called on unmount to ensure all changes are pushed.
+func (e *Engine) SyncNow() error {
+	e.mu.Lock()
+	// Stop any pending timer
+	if e.timer != nil {
+		e.timer.Stop()
+		e.timer = nil
+	}
+	e.mu.Unlock()
+
+	return e.syncDirtyIssues()
+}
+
+// syncDirtyIssues syncs all dirty issues to GitHub.
+func (e *Engine) syncDirtyIssues() error {
+	dirtyIssues, err := e.cache.GetDirtyIssues(e.repo)
+	if err != nil {
+		return fmt.Errorf("failed to get dirty issues: %w", err)
+	}
+
+	if len(dirtyIssues) == 0 {
+		log.Printf("sync: no dirty issues to sync")
+		return nil
+	}
+
+	log.Printf("sync: syncing %d dirty issues", len(dirtyIssues))
+
+	var syncErrors []error
+	for _, issue := range dirtyIssues {
+		if err := e.syncIssue(issue); err != nil {
+			syncErrors = append(syncErrors, fmt.Errorf("issue #%d: %w", issue.Number, err))
+		}
+	}
+
+	if len(syncErrors) > 0 {
+		return fmt.Errorf("sync errors: %v", syncErrors)
+	}
+
 	return nil
 }
 
-// TriggerSync triggers an immediate sync for dirty issues.
-func (e *Engine) TriggerSync() error {
-	// TODO: Implement sync trigger
+// syncIssue syncs a single dirty issue to GitHub.
+// Implements conflict detection: local wins UNLESS remote was updated more recently.
+func (e *Engine) syncIssue(issue cache.Issue) error {
+	log.Printf("sync: checking conflict for issue #%d", issue.Number)
+
+	// Fetch remote to check updated_at
+	remoteIssue, _, err := e.client.GetIssue(e.owner, e.repoName, issue.Number)
+	if err != nil {
+		return fmt.Errorf("failed to fetch remote issue: %w", err)
+	}
+
+	// Parse timestamps for conflict detection
+	localUpdatedAt, err := time.Parse(time.RFC3339, issue.LocalUpdatedAt)
+	if err != nil {
+		return fmt.Errorf("failed to parse local_updated_at: %w", err)
+	}
+
+	remoteUpdatedAt := remoteIssue.UpdatedAt
+
+	// Conflict detection: if remote is newer, skip push (keep dirty for user to resolve)
+	if remoteUpdatedAt.After(localUpdatedAt) {
+		log.Printf("sync: conflict detected for issue #%d - remote is newer (remote: %s, local: %s), keeping dirty",
+			issue.Number, remoteUpdatedAt.Format(time.RFC3339), localUpdatedAt.Format(time.RFC3339))
+		// Per design: local wins UNLESS remote is newer
+		// So if remote is newer, we skip push and keep the issue dirty
+		return nil
+	}
+
+	// Push update to GitHub
+	log.Printf("sync: pushing issue #%d to GitHub", issue.Number)
+	if err := e.client.UpdateIssue(e.owner, e.repoName, issue.Number, issue.Body); err != nil {
+		return fmt.Errorf("failed to update issue on GitHub: %w", err)
+	}
+
+	// Clear dirty flag on success
+	if err := e.cache.ClearDirty(e.repo, issue.Number); err != nil {
+		return fmt.Errorf("failed to clear dirty flag: %w", err)
+	}
+
+	// Refresh the issue to get updated etag and updated_at
+	if _, err := e.RefreshIssue(issue.Number); err != nil {
+		// Log but don't fail - the sync itself succeeded
+		log.Printf("sync: warning: failed to refresh issue #%d after sync: %v", issue.Number, err)
+	}
+
+	log.Printf("sync: successfully synced issue #%d", issue.Number)
 	return nil
+}
+
+// Stop stops the sync engine and any pending timers.
+func (e *Engine) Stop() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.timer != nil {
+		e.timer.Stop()
+		e.timer = nil
+	}
+
+	// Signal stop (for any future background goroutines)
+	select {
+	case <-e.stopCh:
+		// Already closed
+	default:
+		close(e.stopCh)
+	}
+
+	log.Printf("sync: engine stopped")
+}
+
+// HasConflict checks if an issue has a conflict (remote is newer than local).
+// Returns true if remote updated_at > local local_updated_at.
+func (e *Engine) HasConflict(number int) (bool, error) {
+	cachedIssue, err := e.cache.GetIssue(e.repo, number)
+	if err != nil {
+		return false, fmt.Errorf("failed to get cached issue: %w", err)
+	}
+	if cachedIssue == nil {
+		return false, fmt.Errorf("issue #%d not found in cache", number)
+	}
+
+	if !cachedIssue.Dirty {
+		return false, nil // Not dirty, no conflict possible
+	}
+
+	// Fetch remote
+	remoteIssue, _, err := e.client.GetIssue(e.owner, e.repoName, number)
+	if err != nil {
+		return false, fmt.Errorf("failed to fetch remote issue: %w", err)
+	}
+
+	localUpdatedAt, err := time.Parse(time.RFC3339, cachedIssue.LocalUpdatedAt)
+	if err != nil {
+		return false, fmt.Errorf("failed to parse local_updated_at: %w", err)
+	}
+
+	return remoteIssue.UpdatedAt.After(localUpdatedAt), nil
 }
