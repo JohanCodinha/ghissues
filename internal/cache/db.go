@@ -75,7 +75,32 @@ CREATE TABLE IF NOT EXISTS comments (
     body TEXT,
     created_at TEXT,
     updated_at TEXT,
+    dirty INTEGER DEFAULT 0,
     UNIQUE(repo, issue_number, id)
+);
+`
+
+// createPendingCommentsTableSQL defines the schema for pending new comments.
+const createPendingCommentsTableSQL = `
+CREATE TABLE IF NOT EXISTS pending_comments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    issue_number INTEGER NOT NULL,
+    repo TEXT NOT NULL,
+    body TEXT NOT NULL,
+    created_at TEXT,
+    UNIQUE(repo, issue_number, id)
+);
+`
+
+// createPendingIssuesTableSQL defines the schema for pending new issues.
+const createPendingIssuesTableSQL = `
+CREATE TABLE IF NOT EXISTS pending_issues (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo TEXT NOT NULL,
+    title TEXT NOT NULL,
+    body TEXT,
+    labels TEXT,
+    created_at TEXT
 );
 `
 
@@ -105,6 +130,20 @@ func InitDB(path string) (*DB, error) {
 	if err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("failed to create comments table: %w", err)
+	}
+
+	// Create the pending_comments table if it doesn't exist
+	_, err = conn.Exec(createPendingCommentsTableSQL)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("failed to create pending_comments table: %w", err)
+	}
+
+	// Create the pending_issues table if it doesn't exist
+	_, err = conn.Exec(createPendingIssuesTableSQL)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("failed to create pending_issues table: %w", err)
 	}
 
 	return &DB{
@@ -497,4 +536,246 @@ func (db *DB) GetComments(repo string, issueNumber int) ([]Comment, error) {
 	}
 
 	return comments, nil
+}
+
+// PendingComment represents a new comment waiting to be synced.
+type PendingComment struct {
+	ID          int64
+	IssueNumber int
+	Repo        string
+	Body        string
+	CreatedAt   string
+}
+
+// PendingIssue represents a new issue waiting to be synced.
+type PendingIssue struct {
+	ID        int64
+	Repo      string
+	Title     string
+	Body      string
+	Labels    []string
+	CreatedAt string
+}
+
+// AddPendingComment adds a new pending comment to be synced to GitHub.
+func (db *DB) AddPendingComment(repo string, issueNumber int, body string) error {
+	createdAt := time.Now().UTC().Format(time.RFC3339)
+
+	query := `
+		INSERT INTO pending_comments (issue_number, repo, body, created_at)
+		VALUES (?, ?, ?, ?)
+	`
+
+	_, err := db.conn.Exec(query, issueNumber, repo, body, createdAt)
+	if err != nil {
+		return fmt.Errorf("failed to add pending comment: %w", err)
+	}
+
+	return nil
+}
+
+// GetPendingComments retrieves all pending comments for a repository.
+func (db *DB) GetPendingComments(repo string) ([]PendingComment, error) {
+	query := `
+		SELECT id, issue_number, repo, body, created_at
+		FROM pending_comments
+		WHERE repo = ?
+		ORDER BY created_at ASC
+	`
+
+	rows, err := db.conn.Query(query, repo)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query pending comments: %w", err)
+	}
+	defer rows.Close()
+
+	var comments []PendingComment
+	for rows.Next() {
+		var c PendingComment
+		var createdAt sql.NullString
+
+		err := rows.Scan(&c.ID, &c.IssueNumber, &c.Repo, &c.Body, &createdAt)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan pending comment: %w", err)
+		}
+		c.CreatedAt = createdAt.String
+		comments = append(comments, c)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating pending comment rows: %w", err)
+	}
+
+	return comments, nil
+}
+
+// RemovePendingComment removes a pending comment after successful sync.
+func (db *DB) RemovePendingComment(id int64) error {
+	_, err := db.conn.Exec("DELETE FROM pending_comments WHERE id = ?", id)
+	if err != nil {
+		return fmt.Errorf("failed to remove pending comment: %w", err)
+	}
+	return nil
+}
+
+// MarkCommentDirty marks an existing comment as dirty (edited locally).
+func (db *DB) MarkCommentDirty(repo string, commentID int64, newBody string) error {
+	query := `
+		UPDATE comments
+		SET body = ?, dirty = 1
+		WHERE repo = ? AND id = ?
+	`
+
+	result, err := db.conn.Exec(query, newBody, repo, commentID)
+	if err != nil {
+		return fmt.Errorf("failed to mark comment dirty: %w", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to get rows affected: %w", err)
+	}
+
+	if rowsAffected == 0 {
+		return fmt.Errorf("no comment found with repo=%s and id=%d", repo, commentID)
+	}
+
+	return nil
+}
+
+// DirtyComment represents an edited comment to be synced.
+type DirtyComment struct {
+	ID          int64
+	IssueNumber int
+	Repo        string
+	Body        string
+}
+
+// GetDirtyComments retrieves all comments with dirty=1 for a repository.
+func (db *DB) GetDirtyComments(repo string) ([]DirtyComment, error) {
+	query := `
+		SELECT id, issue_number, repo, body
+		FROM comments
+		WHERE repo = ? AND dirty = 1
+		ORDER BY id ASC
+	`
+
+	rows, err := db.conn.Query(query, repo)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query dirty comments: %w", err)
+	}
+	defer rows.Close()
+
+	var comments []DirtyComment
+	for rows.Next() {
+		var c DirtyComment
+		err := rows.Scan(&c.ID, &c.IssueNumber, &c.Repo, &c.Body)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan dirty comment: %w", err)
+		}
+		comments = append(comments, c)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating dirty comment rows: %w", err)
+	}
+
+	return comments, nil
+}
+
+// ClearCommentDirty clears the dirty flag for a comment after successful sync.
+func (db *DB) ClearCommentDirty(repo string, commentID int64) error {
+	query := `
+		UPDATE comments
+		SET dirty = 0
+		WHERE repo = ? AND id = ?
+	`
+
+	_, err := db.conn.Exec(query, repo, commentID)
+	if err != nil {
+		return fmt.Errorf("failed to clear comment dirty flag: %w", err)
+	}
+
+	return nil
+}
+
+// AddPendingIssue adds a new pending issue to be synced to GitHub.
+func (db *DB) AddPendingIssue(repo, title, body string, labels []string) (int64, error) {
+	createdAt := time.Now().UTC().Format(time.RFC3339)
+
+	labelsJSON, err := json.Marshal(labels)
+	if err != nil {
+		return 0, fmt.Errorf("failed to marshal labels: %w", err)
+	}
+
+	query := `
+		INSERT INTO pending_issues (repo, title, body, labels, created_at)
+		VALUES (?, ?, ?, ?, ?)
+	`
+
+	result, err := db.conn.Exec(query, repo, title, body, string(labelsJSON), createdAt)
+	if err != nil {
+		return 0, fmt.Errorf("failed to add pending issue: %w", err)
+	}
+
+	id, err := result.LastInsertId()
+	if err != nil {
+		return 0, fmt.Errorf("failed to get last insert id: %w", err)
+	}
+
+	return id, nil
+}
+
+// GetPendingIssues retrieves all pending issues for a repository.
+func (db *DB) GetPendingIssues(repo string) ([]PendingIssue, error) {
+	query := `
+		SELECT id, repo, title, body, labels, created_at
+		FROM pending_issues
+		WHERE repo = ?
+		ORDER BY created_at ASC
+	`
+
+	rows, err := db.conn.Query(query, repo)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query pending issues: %w", err)
+	}
+	defer rows.Close()
+
+	var issues []PendingIssue
+	for rows.Next() {
+		var i PendingIssue
+		var body, labels, createdAt sql.NullString
+
+		err := rows.Scan(&i.ID, &i.Repo, &i.Title, &body, &labels, &createdAt)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan pending issue: %w", err)
+		}
+
+		i.Body = body.String
+		i.CreatedAt = createdAt.String
+
+		// Parse labels JSON
+		if labels.Valid && labels.String != "" {
+			if err := json.Unmarshal([]byte(labels.String), &i.Labels); err != nil {
+				return nil, fmt.Errorf("failed to unmarshal labels: %w", err)
+			}
+		}
+
+		issues = append(issues, i)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating pending issue rows: %w", err)
+	}
+
+	return issues, nil
+}
+
+// RemovePendingIssue removes a pending issue after successful sync.
+func (db *DB) RemovePendingIssue(id int64) error {
+	_, err := db.conn.Exec("DELETE FROM pending_issues WHERE id = ?", id)
+	if err != nil {
+		return fmt.Errorf("failed to remove pending issue: %w", err)
+	}
+	return nil
 }

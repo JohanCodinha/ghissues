@@ -349,6 +349,106 @@ func (c *Client) ListComments(owner, repo string, number int) ([]Comment, error)
 	return allComments, nil
 }
 
+// CreateComment creates a new comment on an issue.
+// Returns the created comment with its assigned ID.
+func (c *Client) CreateComment(owner, repo string, number int, body string) (*Comment, error) {
+	url := fmt.Sprintf("%s/repos/%s/%s/issues/%d/comments", c.baseURL, owner, repo, number)
+
+	payload := map[string]string{"body": body}
+	jsonPayload, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal payload: %w", err)
+	}
+
+	resp, err := c.doRequest("POST", url, bytes.NewReader(jsonPayload))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	checkRateLimit(resp)
+
+	if resp.StatusCode != http.StatusCreated {
+		respBody, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("GitHub API error: %s - %s", resp.Status, string(respBody))
+	}
+
+	var comment Comment
+	if err := json.NewDecoder(resp.Body).Decode(&comment); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	return &comment, nil
+}
+
+// UpdateComment updates an existing comment.
+func (c *Client) UpdateComment(owner, repo string, commentID int64, body string) error {
+	url := fmt.Sprintf("%s/repos/%s/%s/issues/comments/%d", c.baseURL, owner, repo, commentID)
+
+	payload := map[string]string{"body": body}
+	jsonPayload, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal payload: %w", err)
+	}
+
+	resp, err := c.doRequest("PATCH", url, bytes.NewReader(jsonPayload))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	checkRateLimit(resp)
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("GitHub API error: %s - %s", resp.Status, string(respBody))
+	}
+
+	return nil
+}
+
+// CreateIssue creates a new issue in a repository.
+// Returns the created issue with its assigned number.
+func (c *Client) CreateIssue(owner, repo, title, body string, labels []string) (*Issue, error) {
+	url := fmt.Sprintf("%s/repos/%s/%s/issues", c.baseURL, owner, repo)
+
+	payload := map[string]interface{}{
+		"title": title,
+		"body":  body,
+	}
+	if len(labels) > 0 {
+		payload["labels"] = labels
+	}
+
+	jsonPayload, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal payload: %w", err)
+	}
+
+	resp, err := c.doRequest("POST", url, bytes.NewReader(jsonPayload))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	checkRateLimit(resp)
+
+	if resp.StatusCode != http.StatusCreated {
+		respBody, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("GitHub API error: %s - %s", resp.Status, string(respBody))
+	}
+
+	var issue Issue
+	if err := json.NewDecoder(resp.Body).Decode(&issue); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	etag := resp.Header.Get("ETag")
+	issue.ETag = etag
+
+	return &issue, nil
+}
+
 // GetIssueWithEtag fetches an issue using a conditional request with etag.
 // Returns (nil, "", nil) on 304 Not Modified.
 // Returns (*Issue, newEtag, nil) on 200 OK with new data.

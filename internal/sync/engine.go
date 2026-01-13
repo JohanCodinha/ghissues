@@ -219,7 +219,7 @@ func (e *Engine) TriggerSync() {
 	logger.Debug("sync: debounce timer started/reset (%dms)", e.debounceMs)
 }
 
-// SyncNow immediately syncs all dirty issues.
+// SyncNow immediately syncs all dirty issues, comments, and pending items.
 // This should be called on unmount to ensure all changes are pushed.
 func (e *Engine) SyncNow() error {
 	e.mu.Lock()
@@ -230,7 +230,33 @@ func (e *Engine) SyncNow() error {
 	}
 	e.mu.Unlock()
 
-	return e.syncDirtyIssues()
+	var errs []error
+
+	// Sync pending new comments first (so they exist before any edits)
+	if err := e.syncPendingComments(); err != nil {
+		errs = append(errs, fmt.Errorf("pending comments: %w", err))
+	}
+
+	// Sync dirty (edited) comments
+	if err := e.syncDirtyComments(); err != nil {
+		errs = append(errs, fmt.Errorf("dirty comments: %w", err))
+	}
+
+	// Sync dirty issues
+	if err := e.syncDirtyIssues(); err != nil {
+		errs = append(errs, fmt.Errorf("dirty issues: %w", err))
+	}
+
+	// Sync pending new issues
+	if err := e.syncPendingIssues(); err != nil {
+		errs = append(errs, fmt.Errorf("pending issues: %w", err))
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("sync errors: %v", errs)
+	}
+
+	return nil
 }
 
 // syncDirtyIssues syncs all dirty issues to GitHub.
@@ -372,4 +398,147 @@ func (e *Engine) HasConflict(number int) (bool, error) {
 	}
 
 	return remoteIssue.UpdatedAt.After(localUpdatedAt), nil
+}
+
+// syncPendingComments syncs all pending (new) comments to GitHub.
+func (e *Engine) syncPendingComments() error {
+	pendingComments, err := e.cache.GetPendingComments(e.repo)
+	if err != nil {
+		return fmt.Errorf("failed to get pending comments: %w", err)
+	}
+
+	if len(pendingComments) == 0 {
+		logger.Debug("sync: no pending comments to sync")
+		return nil
+	}
+
+	logger.Debug("sync: syncing %d pending comments", len(pendingComments))
+
+	var syncErrors []error
+	for _, pc := range pendingComments {
+		// Create the comment on GitHub
+		_, err := e.client.CreateComment(e.owner, e.repoName, pc.IssueNumber, pc.Body)
+		if err != nil {
+			syncErrors = append(syncErrors, fmt.Errorf("comment for issue #%d: %w", pc.IssueNumber, err))
+			continue
+		}
+
+		// Remove from pending after successful sync
+		if err := e.cache.RemovePendingComment(pc.ID); err != nil {
+			logger.Warn("sync: failed to remove pending comment %d: %v", pc.ID, err)
+		}
+
+		// Refresh comments for this issue to get the new comment in cache
+		if err := e.syncComments(pc.IssueNumber); err != nil {
+			logger.Warn("sync: failed to refresh comments for issue #%d: %v", pc.IssueNumber, err)
+		}
+
+		logger.Debug("sync: created comment on issue #%d", pc.IssueNumber)
+	}
+
+	if len(syncErrors) > 0 {
+		return fmt.Errorf("sync errors: %v", syncErrors)
+	}
+
+	return nil
+}
+
+// syncDirtyComments syncs all dirty (edited) comments to GitHub.
+func (e *Engine) syncDirtyComments() error {
+	dirtyComments, err := e.cache.GetDirtyComments(e.repo)
+	if err != nil {
+		return fmt.Errorf("failed to get dirty comments: %w", err)
+	}
+
+	if len(dirtyComments) == 0 {
+		logger.Debug("sync: no dirty comments to sync")
+		return nil
+	}
+
+	logger.Debug("sync: syncing %d dirty comments", len(dirtyComments))
+
+	var syncErrors []error
+	for _, dc := range dirtyComments {
+		// Update the comment on GitHub
+		err := e.client.UpdateComment(e.owner, e.repoName, dc.ID, dc.Body)
+		if err != nil {
+			syncErrors = append(syncErrors, fmt.Errorf("comment %d: %w", dc.ID, err))
+			continue
+		}
+
+		// Clear dirty flag after successful sync
+		if err := e.cache.ClearCommentDirty(e.repo, dc.ID); err != nil {
+			logger.Warn("sync: failed to clear dirty flag for comment %d: %v", dc.ID, err)
+		}
+
+		logger.Debug("sync: updated comment %d on issue #%d", dc.ID, dc.IssueNumber)
+	}
+
+	if len(syncErrors) > 0 {
+		return fmt.Errorf("sync errors: %v", syncErrors)
+	}
+
+	return nil
+}
+
+// syncPendingIssues syncs all pending (new) issues to GitHub.
+func (e *Engine) syncPendingIssues() error {
+	pendingIssues, err := e.cache.GetPendingIssues(e.repo)
+	if err != nil {
+		return fmt.Errorf("failed to get pending issues: %w", err)
+	}
+
+	if len(pendingIssues) == 0 {
+		logger.Debug("sync: no pending issues to sync")
+		return nil
+	}
+
+	logger.Debug("sync: syncing %d pending issues", len(pendingIssues))
+
+	var syncErrors []error
+	for _, pi := range pendingIssues {
+		// Create the issue on GitHub
+		ghIssue, err := e.client.CreateIssue(e.owner, e.repoName, pi.Title, pi.Body, pi.Labels)
+		if err != nil {
+			syncErrors = append(syncErrors, fmt.Errorf("issue %q: %w", pi.Title, err))
+			continue
+		}
+
+		// Remove from pending after successful sync
+		if err := e.cache.RemovePendingIssue(pi.ID); err != nil {
+			logger.Warn("sync: failed to remove pending issue %d: %v", pi.ID, err)
+		}
+
+		// Add the newly created issue to the cache
+		labels := make([]string, len(ghIssue.Labels))
+		for i, l := range ghIssue.Labels {
+			labels[i] = l.Name
+		}
+
+		cacheIssue := cache.Issue{
+			Number:    ghIssue.Number,
+			Repo:      e.repo,
+			Title:     ghIssue.Title,
+			Body:      ghIssue.Body,
+			State:     ghIssue.State,
+			Author:    ghIssue.User.Login,
+			Labels:    labels,
+			CreatedAt: ghIssue.CreatedAt.Format(time.RFC3339),
+			UpdatedAt: ghIssue.UpdatedAt.Format(time.RFC3339),
+			ETag:      ghIssue.ETag,
+			Dirty:     false,
+		}
+
+		if err := e.cache.UpsertIssue(cacheIssue); err != nil {
+			logger.Warn("sync: failed to cache newly created issue #%d: %v", ghIssue.Number, err)
+		}
+
+		logger.Debug("sync: created issue #%d: %s", ghIssue.Number, ghIssue.Title)
+	}
+
+	if len(syncErrors) > 0 {
+		return fmt.Errorf("sync errors: %v", syncErrors)
+	}
+
+	return nil
 }

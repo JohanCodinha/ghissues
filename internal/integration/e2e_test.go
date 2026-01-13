@@ -815,6 +815,267 @@ func TestE2E_GrepAcrossFiles(t *testing.T) {
 	})
 }
 
+// TestE2E_AddNewComment tests adding a new comment via file edit
+func TestE2E_AddNewComment(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("FUSE tests require root or CAP_SYS_ADMIN")
+	}
+
+	mockGH := gh.NewMockServer()
+	defer mockGH.Close()
+
+	// Create an issue
+	mockGH.AddIssue(&gh.Issue{
+		Number:    1,
+		Title:     "Issue to Comment On",
+		Body:      "This issue needs a comment",
+		State:     "open",
+		User:      gh.User{Login: "testuser"},
+		CreatedAt: time.Now().Add(-24 * time.Hour),
+		UpdatedAt: time.Now().Add(-1 * time.Hour),
+		ETag:      `"comment-test-etag"`,
+	})
+
+	tmpDir := t.TempDir()
+	mountpoint := filepath.Join(tmpDir, "mount")
+	cachePath := filepath.Join(tmpDir, "cache.db")
+	os.MkdirAll(mountpoint, 0755)
+
+	cacheDB, err := cache.InitDB(cachePath)
+	if err != nil {
+		t.Fatalf("failed to init cache: %v", err)
+	}
+	defer cacheDB.Close()
+
+	client := gh.NewWithBaseURL("test-token", mockGH.URL)
+	engine, err := sync.NewEngine(cacheDB, client, "testowner/testrepo", 100)
+	if err != nil {
+		t.Fatalf("failed to create sync engine: %v", err)
+	}
+	defer engine.Stop()
+
+	if err := engine.InitialSync(); err != nil {
+		t.Fatalf("initial sync failed: %v", err)
+	}
+
+	filesystem := fs.NewFS(cacheDB, "testowner/testrepo", mountpoint, func() {
+		engine.TriggerSync()
+	})
+
+	go filesystem.Mount()
+	time.Sleep(500 * time.Millisecond)
+	defer filesystem.Unmount()
+
+	t.Run("AddCommentViaFileEdit", func(t *testing.T) {
+		files, _ := os.ReadDir(mountpoint)
+		if len(files) == 0 {
+			t.Fatal("no files in mountpoint")
+		}
+
+		filePath := filepath.Join(mountpoint, files[0].Name())
+		content, err := os.ReadFile(filePath)
+		if err != nil {
+			t.Fatalf("failed to read file: %v", err)
+		}
+
+		// Add a new comment section at the end
+		newContent := string(content) + `
+
+## Comments
+
+### new
+<!-- comment_id: new -->
+
+This is my new comment added via file edit.
+`
+		if err := os.WriteFile(filePath, []byte(newContent), 0644); err != nil {
+			t.Fatalf("failed to write file: %v", err)
+		}
+
+		// Wait for sync
+		time.Sleep(300 * time.Millisecond)
+
+		// Verify comment was created on mock server
+		comments := mockGH.GetComments(1)
+		if len(comments) != 1 {
+			t.Fatalf("expected 1 comment on mock server, got %d", len(comments))
+		}
+		if !strings.Contains(comments[0].Body, "new comment added via file edit") {
+			t.Errorf("comment body mismatch: %s", comments[0].Body)
+		}
+	})
+}
+
+// TestE2E_EditExistingComment tests editing an existing comment
+func TestE2E_EditExistingComment(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("FUSE tests require root or CAP_SYS_ADMIN")
+	}
+
+	mockGH := gh.NewMockServer()
+	defer mockGH.Close()
+
+	// Create an issue with an existing comment
+	mockGH.AddIssue(&gh.Issue{
+		Number:    1,
+		Title:     "Issue with Comment to Edit",
+		Body:      "Issue body",
+		State:     "open",
+		User:      gh.User{Login: "testuser"},
+		CreatedAt: time.Now().Add(-24 * time.Hour),
+		UpdatedAt: time.Now().Add(-1 * time.Hour),
+		ETag:      `"edit-comment-etag"`,
+	})
+	mockGH.AddComment(1, &gh.Comment{
+		ID:        12345,
+		User:      gh.User{Login: "commenter"},
+		Body:      "Original comment body",
+		CreatedAt: time.Now().Add(-12 * time.Hour),
+		UpdatedAt: time.Now().Add(-12 * time.Hour),
+	})
+
+	tmpDir := t.TempDir()
+	mountpoint := filepath.Join(tmpDir, "mount")
+	cachePath := filepath.Join(tmpDir, "cache.db")
+	os.MkdirAll(mountpoint, 0755)
+
+	cacheDB, err := cache.InitDB(cachePath)
+	if err != nil {
+		t.Fatalf("failed to init cache: %v", err)
+	}
+	defer cacheDB.Close()
+
+	client := gh.NewWithBaseURL("test-token", mockGH.URL)
+	engine, err := sync.NewEngine(cacheDB, client, "testowner/testrepo", 100)
+	if err != nil {
+		t.Fatalf("failed to create sync engine: %v", err)
+	}
+	defer engine.Stop()
+
+	if err := engine.InitialSync(); err != nil {
+		t.Fatalf("initial sync failed: %v", err)
+	}
+
+	filesystem := fs.NewFS(cacheDB, "testowner/testrepo", mountpoint, func() {
+		engine.TriggerSync()
+	})
+
+	go filesystem.Mount()
+	time.Sleep(500 * time.Millisecond)
+	defer filesystem.Unmount()
+
+	t.Run("EditCommentBody", func(t *testing.T) {
+		files, _ := os.ReadDir(mountpoint)
+		if len(files) == 0 {
+			t.Fatal("no files in mountpoint")
+		}
+
+		filePath := filepath.Join(mountpoint, files[0].Name())
+		content, err := os.ReadFile(filePath)
+		if err != nil {
+			t.Fatalf("failed to read file: %v", err)
+		}
+
+		// Replace the original comment body with edited content
+		newContent := strings.Replace(
+			string(content),
+			"Original comment body",
+			"Edited comment body via FUSE",
+			1,
+		)
+
+		if err := os.WriteFile(filePath, []byte(newContent), 0644); err != nil {
+			t.Fatalf("failed to write file: %v", err)
+		}
+
+		// Wait for sync
+		time.Sleep(300 * time.Millisecond)
+
+		// Verify comment was updated on mock server
+		comments := mockGH.GetComments(1)
+		if len(comments) != 1 {
+			t.Fatalf("expected 1 comment on mock server, got %d", len(comments))
+		}
+		if !strings.Contains(comments[0].Body, "Edited comment body via FUSE") {
+			t.Errorf("comment not updated, body: %s", comments[0].Body)
+		}
+	})
+}
+
+// TestE2E_CreateNewIssue tests creating a new issue via file creation
+func TestE2E_CreateNewIssue(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("FUSE tests require root or CAP_SYS_ADMIN")
+	}
+
+	mockGH := gh.NewMockServer()
+	defer mockGH.Close()
+
+	tmpDir := t.TempDir()
+	mountpoint := filepath.Join(tmpDir, "mount")
+	cachePath := filepath.Join(tmpDir, "cache.db")
+	os.MkdirAll(mountpoint, 0755)
+
+	cacheDB, err := cache.InitDB(cachePath)
+	if err != nil {
+		t.Fatalf("failed to init cache: %v", err)
+	}
+	defer cacheDB.Close()
+
+	client := gh.NewWithBaseURL("test-token", mockGH.URL)
+	engine, err := sync.NewEngine(cacheDB, client, "testowner/testrepo", 100)
+	if err != nil {
+		t.Fatalf("failed to create sync engine: %v", err)
+	}
+	defer engine.Stop()
+
+	filesystem := fs.NewFS(cacheDB, "testowner/testrepo", mountpoint, func() {
+		engine.TriggerSync()
+	})
+
+	go filesystem.Mount()
+	time.Sleep(500 * time.Millisecond)
+	defer filesystem.Unmount()
+
+	t.Run("CreateIssueViaNewFile", func(t *testing.T) {
+		// Create a new issue file with [new] marker
+		newFilePath := filepath.Join(mountpoint, "my-new-feature-request[new].md")
+
+		issueContent := `---
+repo: testowner/testrepo
+state: open
+labels: []
+---
+
+# My New Feature Request
+
+## Body
+
+This is a new feature request created via the FUSE filesystem.
+
+Please add support for dark mode.
+`
+		if err := os.WriteFile(newFilePath, []byte(issueContent), 0644); err != nil {
+			t.Fatalf("failed to create new issue file: %v", err)
+		}
+
+		// Wait for sync
+		time.Sleep(300 * time.Millisecond)
+
+		// Verify issue was created on mock server
+		issue := mockGH.GetIssue(1) // Mock server assigns #1
+		if issue == nil {
+			t.Fatal("issue not created on mock server")
+		}
+		if issue.Title != "My New Feature Request" {
+			t.Errorf("expected title 'My New Feature Request', got '%s'", issue.Title)
+		}
+		if !strings.Contains(issue.Body, "dark mode") {
+			t.Errorf("body doesn't contain expected content: %s", issue.Body)
+		}
+	})
+}
+
 // TestE2E_FindCommand tests using find command on mounted filesystem
 func TestE2E_FindCommand(t *testing.T) {
 	if os.Getuid() != 0 {

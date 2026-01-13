@@ -25,13 +25,19 @@ type MockServer struct {
 	// Error simulation
 	forceStatusCode int    // If set, return this status code for next request
 	forceErrorBody  string // Error body to return with forceStatusCode
+
+	// Counters for ID generation
+	nextCommentID int64
+	nextIssueNum  int
 }
 
 // NewMockServer creates a mock GitHub API server
 func NewMockServer() *MockServer {
 	m := &MockServer{
-		issues:   make(map[int]*Issue),
-		comments: make(map[int][]*Comment),
+		issues:        make(map[int]*Issue),
+		comments:      make(map[int][]*Comment),
+		nextCommentID: 1000,
+		nextIssueNum:  1,
 	}
 
 	mux := http.NewServeMux()
@@ -47,12 +53,22 @@ func NewMockServer() *MockServer {
 		// /repos/{owner}/{repo}/issues
 		if parts[2] == "issues" {
 			if len(parts) == 3 {
-				// List issues
-				if r.Method == http.MethodGet {
+				// List issues or create issue
+				switch r.Method {
+				case http.MethodGet:
 					m.handleListIssues(w, r)
+					return
+				case http.MethodPost:
+					m.handleCreateIssue(w, r)
 					return
 				}
 			} else if len(parts) == 4 {
+				// Check if this is the /comments endpoint (for updating comments)
+				if parts[3] == "comments" {
+					// This path shouldn't happen at len==4
+					http.Error(w, "not found", http.StatusNotFound)
+					return
+				}
 				// Single issue: /repos/{owner}/{repo}/issues/{number}
 				number, err := strconv.Atoi(parts[3])
 				if err != nil {
@@ -69,16 +85,35 @@ func NewMockServer() *MockServer {
 				}
 				return
 			} else if len(parts) == 5 && parts[4] == "comments" {
-				// List comments: /repos/{owner}/{repo}/issues/{number}/comments
+				// /repos/{owner}/{repo}/issues/{number}/comments
 				number, err := strconv.Atoi(parts[3])
 				if err != nil {
 					http.Error(w, "invalid issue number", http.StatusBadRequest)
 					return
 				}
-				if r.Method == http.MethodGet {
+				switch r.Method {
+				case http.MethodGet:
 					m.handleListComments(w, r, number)
+				case http.MethodPost:
+					m.handleCreateComment(w, r, number)
+				default:
+					http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				}
+				return
+			} else if len(parts) == 5 && parts[3] == "comments" {
+				// /repos/{owner}/{repo}/issues/comments/{comment_id}
+				commentID, err := strconv.ParseInt(parts[4], 10, 64)
+				if err != nil {
+					http.Error(w, "invalid comment id", http.StatusBadRequest)
 					return
 				}
+				switch r.Method {
+				case http.MethodPatch:
+					m.handleUpdateComment(w, r, commentID)
+				default:
+					http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				}
+				return
 			}
 		}
 		http.Error(w, "not found", http.StatusNotFound)
@@ -331,4 +366,148 @@ func (m *MockServer) handleListComments(w http.ResponseWriter, r *http.Request, 
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(comments)
+}
+
+func (m *MockServer) handleCreateComment(w http.ResponseWriter, r *http.Request, number int) {
+	m.mu.Lock()
+	// Check for forced error first
+	if code, body := m.clearError(); code != 0 {
+		m.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(code)
+		w.Write([]byte(body))
+		return
+	}
+
+	// Check if issue exists
+	if _, ok := m.issues[number]; !ok {
+		m.mu.Unlock()
+		http.Error(w, `{"message":"Not Found"}`, http.StatusNotFound)
+		return
+	}
+
+	var payload struct {
+		Body string `json:"body"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		m.mu.Unlock()
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+
+	now := time.Now().UTC()
+	comment := &Comment{
+		ID:        m.nextCommentID,
+		User:      User{Login: "test-user"},
+		Body:      payload.Body,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	m.nextCommentID++
+	m.comments[number] = append(m.comments[number], comment)
+	m.mu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(comment)
+}
+
+func (m *MockServer) handleUpdateComment(w http.ResponseWriter, r *http.Request, commentID int64) {
+	m.mu.Lock()
+	// Check for forced error first
+	if code, body := m.clearError(); code != 0 {
+		m.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(code)
+		w.Write([]byte(body))
+		return
+	}
+
+	// Find the comment
+	var foundComment *Comment
+	for _, comments := range m.comments {
+		for _, c := range comments {
+			if c.ID == commentID {
+				foundComment = c
+				break
+			}
+		}
+		if foundComment != nil {
+			break
+		}
+	}
+
+	if foundComment == nil {
+		m.mu.Unlock()
+		http.Error(w, `{"message":"Not Found"}`, http.StatusNotFound)
+		return
+	}
+
+	var payload struct {
+		Body string `json:"body"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		m.mu.Unlock()
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+
+	foundComment.Body = payload.Body
+	foundComment.UpdatedAt = time.Now().UTC()
+	m.mu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(foundComment)
+}
+
+func (m *MockServer) handleCreateIssue(w http.ResponseWriter, r *http.Request) {
+	m.mu.Lock()
+	// Check for forced error first
+	if code, body := m.clearError(); code != 0 {
+		m.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(code)
+		w.Write([]byte(body))
+		return
+	}
+
+	var payload struct {
+		Title  string   `json:"title"`
+		Body   string   `json:"body"`
+		Labels []string `json:"labels,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		m.mu.Unlock()
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+
+	now := time.Now().UTC()
+	etag := `"` + strconv.FormatInt(now.UnixNano(), 16) + `"`
+
+	// Convert labels to Label structs
+	labels := make([]Label, len(payload.Labels))
+	for i, name := range payload.Labels {
+		labels[i] = Label{Name: name}
+	}
+
+	issue := &Issue{
+		Number:    m.nextIssueNum,
+		Title:     payload.Title,
+		Body:      payload.Body,
+		State:     "open",
+		Labels:    labels,
+		User:      User{Login: "test-user"},
+		CreatedAt: now,
+		UpdatedAt: now,
+		ETag:      etag,
+	}
+	m.issues[m.nextIssueNum] = issue
+	m.nextIssueNum++
+	m.mu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("ETag", etag)
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(issue)
 }

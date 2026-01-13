@@ -1230,3 +1230,244 @@ func TestSyncIssue_TitleAndBodyChange(t *testing.T) {
 		t.Error("issue should not be dirty after successful sync")
 	}
 }
+
+func TestSyncPendingComments(t *testing.T) {
+	// Set up mock server
+	mockGH := gh.NewMockServer()
+	defer mockGH.Close()
+
+	// Add an issue to comment on
+	mockGH.AddIssue(&gh.Issue{
+		Number:    1,
+		Title:     "Test Issue",
+		Body:      "Test body",
+		State:     "open",
+		User:      gh.User{Login: "testuser"},
+		CreatedAt: time.Now().Add(-time.Hour),
+		UpdatedAt: time.Now().Add(-time.Hour),
+		ETag:      `"test-etag"`,
+	})
+
+	// Create cache
+	tmpDir, err := os.MkdirTemp("", "sync-test-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	dbPath := filepath.Join(tmpDir, "test.db")
+	cacheDB, err := cache.InitDB(dbPath)
+	if err != nil {
+		t.Fatalf("failed to init cache: %v", err)
+	}
+	defer cacheDB.Close()
+
+	// Create engine
+	client := gh.NewWithBaseURL("test-token", mockGH.URL)
+	engine, err := NewEngine(cacheDB, client, "owner/repo", 100)
+	if err != nil {
+		t.Fatalf("failed to create engine: %v", err)
+	}
+
+	// Add pending comment
+	err = cacheDB.AddPendingComment("owner/repo", 1, "This is a new comment")
+	if err != nil {
+		t.Fatalf("failed to add pending comment: %v", err)
+	}
+
+	// Verify pending comment exists
+	pending, err := cacheDB.GetPendingComments("owner/repo")
+	if err != nil {
+		t.Fatalf("failed to get pending comments: %v", err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("expected 1 pending comment, got %d", len(pending))
+	}
+
+	// Sync
+	err = engine.SyncNow()
+	if err != nil {
+		t.Fatalf("SyncNow() unexpected error: %v", err)
+	}
+
+	// Verify comment was created on remote
+	comments := mockGH.GetComments(1)
+	if len(comments) != 1 {
+		t.Errorf("expected 1 comment on remote, got %d", len(comments))
+	}
+	if comments[0].Body != "This is a new comment" {
+		t.Errorf("expected comment body 'This is a new comment', got %q", comments[0].Body)
+	}
+
+	// Verify pending comment was removed
+	pending, err = cacheDB.GetPendingComments("owner/repo")
+	if err != nil {
+		t.Fatalf("failed to get pending comments after sync: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Errorf("expected 0 pending comments after sync, got %d", len(pending))
+	}
+}
+
+func TestSyncDirtyComments(t *testing.T) {
+	// Set up mock server
+	mockGH := gh.NewMockServer()
+	defer mockGH.Close()
+
+	// Add an issue with a comment
+	mockGH.AddIssue(&gh.Issue{
+		Number:    1,
+		Title:     "Test Issue",
+		Body:      "Test body",
+		State:     "open",
+		User:      gh.User{Login: "testuser"},
+		CreatedAt: time.Now().Add(-time.Hour),
+		UpdatedAt: time.Now().Add(-time.Hour),
+		ETag:      `"test-etag"`,
+	})
+	mockGH.AddComment(1, &gh.Comment{
+		ID:        12345,
+		Body:      "Original comment",
+		User:      gh.User{Login: "testuser"},
+		CreatedAt: time.Now().Add(-time.Hour),
+		UpdatedAt: time.Now().Add(-time.Hour),
+	})
+
+	// Create cache
+	tmpDir, err := os.MkdirTemp("", "sync-test-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	dbPath := filepath.Join(tmpDir, "test.db")
+	cacheDB, err := cache.InitDB(dbPath)
+	if err != nil {
+		t.Fatalf("failed to init cache: %v", err)
+	}
+	defer cacheDB.Close()
+
+	// Create engine
+	client := gh.NewWithBaseURL("test-token", mockGH.URL)
+	engine, err := NewEngine(cacheDB, client, "owner/repo", 100)
+	if err != nil {
+		t.Fatalf("failed to create engine: %v", err)
+	}
+
+	// Initial sync to get comment in cache
+	err = engine.InitialSync()
+	if err != nil {
+		t.Fatalf("InitialSync() failed: %v", err)
+	}
+
+	// Mark comment as dirty with new body
+	err = cacheDB.MarkCommentDirty("owner/repo", 12345, "Updated comment body")
+	if err != nil {
+		t.Fatalf("failed to mark comment dirty: %v", err)
+	}
+
+	// Sync
+	err = engine.SyncNow()
+	if err != nil {
+		t.Fatalf("SyncNow() unexpected error: %v", err)
+	}
+
+	// Verify comment was updated on remote
+	comments := mockGH.GetComments(1)
+	if len(comments) != 1 {
+		t.Fatalf("expected 1 comment on remote, got %d", len(comments))
+	}
+	if comments[0].Body != "Updated comment body" {
+		t.Errorf("expected comment body 'Updated comment body', got %q", comments[0].Body)
+	}
+
+	// Verify dirty flag was cleared
+	dirtyComments, err := cacheDB.GetDirtyComments("owner/repo")
+	if err != nil {
+		t.Fatalf("failed to get dirty comments: %v", err)
+	}
+	if len(dirtyComments) != 0 {
+		t.Errorf("expected 0 dirty comments after sync, got %d", len(dirtyComments))
+	}
+}
+
+func TestSyncPendingIssues(t *testing.T) {
+	// Set up mock server
+	mockGH := gh.NewMockServer()
+	defer mockGH.Close()
+
+	// Create cache
+	tmpDir, err := os.MkdirTemp("", "sync-test-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	dbPath := filepath.Join(tmpDir, "test.db")
+	cacheDB, err := cache.InitDB(dbPath)
+	if err != nil {
+		t.Fatalf("failed to init cache: %v", err)
+	}
+	defer cacheDB.Close()
+
+	// Create engine
+	client := gh.NewWithBaseURL("test-token", mockGH.URL)
+	engine, err := NewEngine(cacheDB, client, "owner/repo", 100)
+	if err != nil {
+		t.Fatalf("failed to create engine: %v", err)
+	}
+
+	// Add pending issue
+	_, err = cacheDB.AddPendingIssue("owner/repo", "New Feature Request", "Please add this feature", []string{"enhancement"})
+	if err != nil {
+		t.Fatalf("failed to add pending issue: %v", err)
+	}
+
+	// Verify pending issue exists
+	pending, err := cacheDB.GetPendingIssues("owner/repo")
+	if err != nil {
+		t.Fatalf("failed to get pending issues: %v", err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("expected 1 pending issue, got %d", len(pending))
+	}
+
+	// Sync
+	err = engine.SyncNow()
+	if err != nil {
+		t.Fatalf("SyncNow() unexpected error: %v", err)
+	}
+
+	// Verify issue was created on remote
+	remoteIssue := mockGH.GetIssue(1) // Mock server assigns issue #1
+	if remoteIssue == nil {
+		t.Fatal("expected issue to be created on remote")
+	}
+	if remoteIssue.Title != "New Feature Request" {
+		t.Errorf("expected title 'New Feature Request', got %q", remoteIssue.Title)
+	}
+	if remoteIssue.Body != "Please add this feature" {
+		t.Errorf("expected body 'Please add this feature', got %q", remoteIssue.Body)
+	}
+
+	// Verify pending issue was removed
+	pending, err = cacheDB.GetPendingIssues("owner/repo")
+	if err != nil {
+		t.Fatalf("failed to get pending issues after sync: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Errorf("expected 0 pending issues after sync, got %d", len(pending))
+	}
+
+	// Verify issue was added to cache
+	cachedIssue, err := cacheDB.GetIssue("owner/repo", 1)
+	if err != nil {
+		t.Fatalf("failed to get cached issue: %v", err)
+	}
+	if cachedIssue == nil {
+		t.Fatal("expected newly created issue to be in cache")
+	}
+	if cachedIssue.Title != "New Feature Request" {
+		t.Errorf("cached issue title mismatch: expected 'New Feature Request', got %q", cachedIssue.Title)
+	}
+}

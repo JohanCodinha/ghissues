@@ -906,3 +906,194 @@ func TestCheckRateLimit_NoWarningWhenResetMissing(t *testing.T) {
 		t.Errorf("expected no output when reset header missing, got: %s", output)
 	}
 }
+
+// =============================================================================
+// CreateComment Tests
+// =============================================================================
+
+func TestCreateComment_Success(t *testing.T) {
+	mockGH := NewMockServer()
+	defer mockGH.Close()
+
+	// Add an issue to comment on
+	mockGH.AddIssue(&Issue{
+		Number: 42,
+		Title:  "Test Issue",
+		Body:   "Test body",
+		State:  "open",
+		ETag:   `"test-etag"`,
+	})
+
+	client := NewWithBaseURL("test-token", mockGH.URL)
+
+	comment, err := client.CreateComment("owner", "repo", 42, "This is a new comment")
+	if err != nil {
+		t.Fatalf("CreateComment() unexpected error: %v", err)
+	}
+
+	if comment.ID == 0 {
+		t.Error("Expected non-zero comment ID")
+	}
+	if comment.Body != "This is a new comment" {
+		t.Errorf("Expected body 'This is a new comment', got '%s'", comment.Body)
+	}
+
+	// Verify comment was added to mock server
+	comments := mockGH.GetComments(42)
+	if len(comments) != 1 {
+		t.Errorf("Expected 1 comment in mock server, got %d", len(comments))
+	}
+}
+
+func TestCreateComment_IssueNotFound(t *testing.T) {
+	mockGH := NewMockServer()
+	defer mockGH.Close()
+
+	client := NewWithBaseURL("test-token", mockGH.URL)
+
+	_, err := client.CreateComment("owner", "repo", 999, "Comment on non-existent issue")
+	if err == nil {
+		t.Fatal("CreateComment() expected error for non-existent issue, got nil")
+	}
+
+	if !strings.Contains(err.Error(), "404") && !strings.Contains(err.Error(), "Not Found") {
+		t.Errorf("Expected 404/Not Found error, got: %v", err)
+	}
+}
+
+// =============================================================================
+// UpdateComment Tests
+// =============================================================================
+
+func TestUpdateComment_Success(t *testing.T) {
+	mockGH := NewMockServer()
+	defer mockGH.Close()
+
+	// Add an issue and a comment
+	mockGH.AddIssue(&Issue{
+		Number: 42,
+		Title:  "Test Issue",
+		State:  "open",
+	})
+	mockGH.AddComment(42, &Comment{
+		ID:        12345,
+		Body:      "Original comment body",
+		User:      User{Login: "testuser"},
+		CreatedAt: time.Now().Add(-time.Hour),
+		UpdatedAt: time.Now().Add(-time.Hour),
+	})
+
+	client := NewWithBaseURL("test-token", mockGH.URL)
+
+	err := client.UpdateComment("owner", "repo", 12345, "Updated comment body")
+	if err != nil {
+		t.Fatalf("UpdateComment() unexpected error: %v", err)
+	}
+
+	// Verify comment was updated in mock server
+	comments := mockGH.GetComments(42)
+	if len(comments) != 1 {
+		t.Fatalf("Expected 1 comment, got %d", len(comments))
+	}
+	if comments[0].Body != "Updated comment body" {
+		t.Errorf("Expected body 'Updated comment body', got '%s'", comments[0].Body)
+	}
+}
+
+func TestUpdateComment_NotFound(t *testing.T) {
+	mockGH := NewMockServer()
+	defer mockGH.Close()
+
+	client := NewWithBaseURL("test-token", mockGH.URL)
+
+	err := client.UpdateComment("owner", "repo", 99999, "Update non-existent comment")
+	if err == nil {
+		t.Fatal("UpdateComment() expected error for non-existent comment, got nil")
+	}
+
+	if !strings.Contains(err.Error(), "404") && !strings.Contains(err.Error(), "Not Found") {
+		t.Errorf("Expected 404/Not Found error, got: %v", err)
+	}
+}
+
+// =============================================================================
+// CreateIssue Tests
+// =============================================================================
+
+func TestCreateIssue_Success(t *testing.T) {
+	mockGH := NewMockServer()
+	defer mockGH.Close()
+
+	client := NewWithBaseURL("test-token", mockGH.URL)
+
+	issue, err := client.CreateIssue("owner", "repo", "New Issue Title", "Issue body content", []string{"bug", "p1"})
+	if err != nil {
+		t.Fatalf("CreateIssue() unexpected error: %v", err)
+	}
+
+	if issue.Number == 0 {
+		t.Error("Expected non-zero issue number")
+	}
+	if issue.Title != "New Issue Title" {
+		t.Errorf("Expected title 'New Issue Title', got '%s'", issue.Title)
+	}
+	if issue.Body != "Issue body content" {
+		t.Errorf("Expected body 'Issue body content', got '%s'", issue.Body)
+	}
+	if issue.State != "open" {
+		t.Errorf("Expected state 'open', got '%s'", issue.State)
+	}
+	if len(issue.Labels) != 2 {
+		t.Errorf("Expected 2 labels, got %d", len(issue.Labels))
+	}
+	if issue.ETag == "" {
+		t.Error("Expected non-empty ETag")
+	}
+
+	// Verify issue was added to mock server
+	created := mockGH.GetIssue(issue.Number)
+	if created == nil {
+		t.Fatal("Issue not found in mock server")
+	}
+	if created.Title != "New Issue Title" {
+		t.Errorf("Mock server issue title mismatch: expected 'New Issue Title', got '%s'", created.Title)
+	}
+}
+
+func TestCreateIssue_NoLabels(t *testing.T) {
+	mockGH := NewMockServer()
+	defer mockGH.Close()
+
+	client := NewWithBaseURL("test-token", mockGH.URL)
+
+	issue, err := client.CreateIssue("owner", "repo", "Issue Without Labels", "Body", nil)
+	if err != nil {
+		t.Fatalf("CreateIssue() unexpected error: %v", err)
+	}
+
+	if issue.Number == 0 {
+		t.Error("Expected non-zero issue number")
+	}
+	if len(issue.Labels) != 0 {
+		t.Errorf("Expected 0 labels, got %d", len(issue.Labels))
+	}
+}
+
+func TestCreateIssue_Error(t *testing.T) {
+	mockGH := NewMockServer()
+	defer mockGH.Close()
+
+	// Force a validation error
+	mockGH.SetNextError(422, `{"message":"Validation Failed","errors":[{"resource":"Issue","field":"title","code":"missing"}]}`)
+
+	client := NewWithBaseURL("test-token", mockGH.URL)
+
+	_, err := client.CreateIssue("owner", "repo", "", "Body without title", nil)
+	if err == nil {
+		t.Fatal("CreateIssue() expected validation error, got nil")
+	}
+
+	if !strings.Contains(err.Error(), "422") && !strings.Contains(err.Error(), "Validation") {
+		t.Errorf("Expected 422/Validation error, got: %v", err)
+	}
+}

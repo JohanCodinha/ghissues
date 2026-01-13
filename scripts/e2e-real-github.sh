@@ -318,18 +318,71 @@ fi
 echo "✓ file type: $FILE_TYPE"
 
 echo ""
-echo "=== Step 8.7: Test unsupported operations fail gracefully ==="
-echo "Testing unsupported operations..."
+echo "=== Step 8.7: Test adding comment via file edit ==="
+# Read current content
+CURRENT_CONTENT=$(cat "$MOUNTPOINT/$ISSUE_FILE")
 
-# touch (create new file) - should fail
-if touch "$MOUNTPOINT/new-file.md" 2>/dev/null; then
-    echo "WARNING: touch succeeded unexpectedly"
-    rm -f "$MOUNTPOINT/new-file.md" 2>/dev/null
+# Add a new comment to the file
+cat >> "$MOUNTPOINT/$ISSUE_FILE" << 'COMMENT_EOF'
+
+## Comments
+
+### new
+<!-- comment_id: new -->
+
+E2E_NEW_COMMENT_MARKER - This comment was added by editing the file directly.
+COMMENT_EOF
+
+echo "Added new comment via file edit, waiting for sync..."
+sleep 3
+
+# Verify comment was created on GitHub
+COMMENTS_DATA=$(github_api GET "/repos/$TEST_REPO/issues/$ISSUE_NUMBER/comments")
+if echo "$COMMENTS_DATA" | grep -q "E2E_NEW_COMMENT_MARKER"; then
+    echo "✓ New comment synced to GitHub"
 else
-    echo "✓ touch correctly rejected"
+    echo "WARNING: New comment not found on GitHub (may need more sync time)"
+    echo "Comments data: $COMMENTS_DATA"
 fi
 
-# rm (delete) - should fail
+echo ""
+echo "=== Step 8.8: Test creating new issue via file creation ==="
+# Create a new issue file with [new] marker
+NEW_ISSUE_FILE="$MOUNTPOINT/test-feature-request[new].md"
+cat > "$NEW_ISSUE_FILE" << 'NEWISSUE_EOF'
+---
+repo: testowner/testrepo
+state: open
+labels: []
+---
+
+# Test Feature Request
+
+## Body
+
+E2E_NEW_ISSUE_MARKER - This issue was created by creating a new file in the mounted filesystem.
+
+This tests the Slice 3 functionality for creating new issues.
+NEWISSUE_EOF
+
+echo "Created new issue file, waiting for sync..."
+sleep 3
+
+# Verify new issue was created on GitHub
+NEW_ISSUES=$(github_api GET "/repos/$TEST_REPO/issues?state=all")
+if echo "$NEW_ISSUES" | grep -q "E2E_NEW_ISSUE_MARKER"; then
+    echo "✓ New issue created on GitHub"
+elif echo "$NEW_ISSUES" | grep -q "Test Feature Request"; then
+    echo "✓ New issue created on GitHub (found by title)"
+else
+    echo "WARNING: New issue not found on GitHub (may need more sync time)"
+fi
+
+echo ""
+echo "=== Step 8.9: Test unsupported operations fail gracefully ==="
+echo "Testing unsupported operations..."
+
+# rm (delete) should fail
 if rm "$MOUNTPOINT/$ISSUE_FILE" 2>/dev/null; then
     echo "ERROR: rm succeeded - this is dangerous!"
     kill $MOUNT_PID 2>/dev/null || true

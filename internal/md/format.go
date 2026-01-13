@@ -4,6 +4,7 @@ package md
 import (
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/JohanCodinha/ghissues/internal/cache"
@@ -17,17 +18,35 @@ type ParsedIssue struct {
 	Title  string
 	Body   string
 	// Frontmatter fields for reference
-	State  string
-	Author string
-	ETag   string
+	State    string
+	Author   string
+	ETag     string
+	Comments []ParsedComment
+}
+
+// ParsedComment represents a comment parsed from markdown.
+type ParsedComment struct {
+	ID     int64  // 0 for new comments, >0 for existing
+	Author string // parsed from header, may be empty for new comments
+	Body   string
+	IsNew  bool // true if this is a new comment (no valid comment_id)
 }
 
 // Changes indicates what was modified between original and parsed issue.
 type Changes struct {
-	TitleChanged bool
-	BodyChanged  bool
-	NewTitle     string
-	NewBody      string
+	TitleChanged    bool
+	BodyChanged     bool
+	NewTitle        string
+	NewBody         string
+	CommentChanges  []CommentChange
+	NewComments     []ParsedComment // Comments with IsNew=true
+	EditedComments  []CommentChange // Existing comments that were modified
+}
+
+// CommentChange represents a change to an existing comment.
+type CommentChange struct {
+	ID      int64
+	NewBody string
 }
 
 // frontmatter represents the YAML frontmatter structure.
@@ -152,6 +171,10 @@ func FromMarkdown(content string) (*ParsedIssue, error) {
 	body := extractBody(remaining)
 	parsed.Body = body
 
+	// Extract comments from ## Comments section
+	comments := extractComments(remaining)
+	parsed.Comments = comments
+
 	return parsed, nil
 }
 
@@ -175,6 +198,42 @@ func DetectChanges(original *cache.Issue, parsed *ParsedIssue) Changes {
 	}
 
 	return changes
+}
+
+// DetectCommentChanges compares parsed comments with original cached comments.
+// Returns new comments and edited comments separately.
+func DetectCommentChanges(originalComments []cache.Comment, parsedComments []ParsedComment) (newComments []ParsedComment, editedComments []CommentChange) {
+	// Build a map of original comment IDs to their bodies
+	originalByID := make(map[int64]string)
+	for _, c := range originalComments {
+		originalByID[c.ID] = c.Body
+	}
+
+	for _, pc := range parsedComments {
+		if pc.IsNew || pc.ID == 0 {
+			// This is a new comment
+			if strings.TrimSpace(pc.Body) != "" {
+				newComments = append(newComments, pc)
+			}
+		} else {
+			// Existing comment - check if body changed
+			origBody, exists := originalByID[pc.ID]
+			if exists {
+				// Normalize bodies for comparison
+				origNorm := strings.TrimRight(origBody, "\n\r")
+				parsedNorm := strings.TrimRight(pc.Body, "\n\r")
+				if origNorm != parsedNorm {
+					editedComments = append(editedComments, CommentChange{
+						ID:      pc.ID,
+						NewBody: pc.Body,
+					})
+				}
+			}
+			// If ID doesn't exist in original, ignore (orphaned comment reference)
+		}
+	}
+
+	return newComments, editedComments
 }
 
 // extractFrontmatter parses YAML frontmatter from markdown content.
@@ -280,4 +339,171 @@ func extractBody(content string) string {
 	body = strings.TrimRight(body, "\n\r")
 
 	return body
+}
+
+// commentHeaderRegex matches comment headers: ### timestamp - author
+var commentHeaderRegex = regexp.MustCompile(`(?m)^### (.+?) - (.+)$`)
+
+// commentIDRegex matches the comment_id HTML comment: <!-- comment_id: 123 -->
+var commentIDRegex = regexp.MustCompile(`<!--\s*comment_id:\s*(\w+)\s*-->`)
+
+// extractComments parses the ## Comments section and extracts individual comments.
+// Comments are expected in the format:
+//
+//	### 2026-01-10T14:12:00Z - alice
+//	<!-- comment_id: 987654 -->
+//
+//	Comment body here.
+//
+// For new comments, the header can be:
+//
+//	### new
+//	<!-- comment_id: new -->
+//
+//	New comment body.
+func extractComments(content string) []ParsedComment {
+	// Find ## Comments section
+	commentsPattern := regexp.MustCompile(`(?m)^## Comments\s*$`)
+	loc := commentsPattern.FindStringIndex(content)
+	if loc == nil {
+		return nil
+	}
+
+	// Start after the ## Comments line
+	afterHeader := content[loc[1]:]
+
+	// Skip leading newline
+	if len(afterHeader) > 0 && afterHeader[0] == '\n' {
+		afterHeader = afterHeader[1:]
+	}
+
+	// Find the next ## heading (if any, to delimit the comments section)
+	nextSectionPattern := regexp.MustCompile(`(?m)^## [^#]`)
+	nextLoc := nextSectionPattern.FindStringIndex(afterHeader)
+	var commentsSection string
+	if nextLoc != nil {
+		commentsSection = afterHeader[:nextLoc[0]]
+	} else {
+		commentsSection = afterHeader
+	}
+
+	// Split into individual comments by ### headers
+	// Each comment starts with ### (timestamp - author) or ### new
+	commentBlocks := splitCommentBlocks(commentsSection)
+
+	var comments []ParsedComment
+	for _, block := range commentBlocks {
+		comment := parseCommentBlock(block)
+		if comment != nil {
+			comments = append(comments, *comment)
+		}
+	}
+
+	return comments
+}
+
+// splitCommentBlocks splits the comments section into individual comment blocks.
+// Each block starts with ### and ends before the next ### or end of content.
+func splitCommentBlocks(content string) []string {
+	headerPattern := regexp.MustCompile(`(?m)^### `)
+	indices := headerPattern.FindAllStringIndex(content, -1)
+
+	if len(indices) == 0 {
+		return nil
+	}
+
+	var blocks []string
+	for i, loc := range indices {
+		start := loc[0]
+		var end int
+		if i+1 < len(indices) {
+			end = indices[i+1][0]
+		} else {
+			end = len(content)
+		}
+		block := content[start:end]
+		blocks = append(blocks, block)
+	}
+
+	return blocks
+}
+
+// parseCommentBlock parses a single comment block and returns a ParsedComment.
+// Returns nil if the block is invalid.
+func parseCommentBlock(block string) *ParsedComment {
+	lines := strings.SplitN(block, "\n", -1)
+	if len(lines) == 0 {
+		return nil
+	}
+
+	// First line should be the header: ### timestamp - author or ### new
+	headerLine := strings.TrimSpace(lines[0])
+	if !strings.HasPrefix(headerLine, "### ") {
+		return nil
+	}
+
+	header := strings.TrimPrefix(headerLine, "### ")
+	comment := &ParsedComment{}
+
+	// Check if this is a "new" comment
+	if strings.ToLower(strings.TrimSpace(header)) == "new" {
+		comment.IsNew = true
+		comment.ID = 0
+	} else {
+		// Try to parse as "timestamp - author"
+		matches := commentHeaderRegex.FindStringSubmatch(headerLine)
+		if matches != nil && len(matches) >= 3 {
+			comment.Author = matches[2]
+		}
+	}
+
+	// Look for comment_id in the remaining lines
+	var bodyStartIdx int
+	for i, line := range lines[1:] {
+		trimmed := strings.TrimSpace(line)
+
+		// Look for comment_id HTML comment
+		if idMatch := commentIDRegex.FindStringSubmatch(trimmed); idMatch != nil {
+			idStr := idMatch[1]
+			if strings.ToLower(idStr) == "new" {
+				comment.IsNew = true
+				comment.ID = 0
+			} else {
+				id, err := strconv.ParseInt(idStr, 10, 64)
+				if err == nil {
+					comment.ID = id
+				} else {
+					// Invalid ID format, treat as new
+					comment.IsNew = true
+					comment.ID = 0
+				}
+			}
+			bodyStartIdx = i + 2 // Skip to line after comment_id
+			continue
+		}
+
+		// Empty lines before body
+		if trimmed == "" && bodyStartIdx == 0 {
+			continue
+		}
+
+		// Start of body content
+		if bodyStartIdx == 0 && trimmed != "" {
+			bodyStartIdx = i + 1
+		}
+	}
+
+	// Extract body from the remaining lines
+	if bodyStartIdx > 0 && bodyStartIdx < len(lines) {
+		bodyLines := lines[bodyStartIdx:]
+		// Skip leading empty lines
+		for len(bodyLines) > 0 && strings.TrimSpace(bodyLines[0]) == "" {
+			bodyLines = bodyLines[1:]
+		}
+		body := strings.Join(bodyLines, "\n")
+		body = strings.TrimRight(body, "\n\r")
+		comment.Body = body
+	}
+
+	return comment
 }

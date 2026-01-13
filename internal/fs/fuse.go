@@ -42,6 +42,9 @@ func parseIssueTime(timestamp string) time.Time {
 // filenameRegex matches issue filenames in the format: title[number].md
 var filenameRegex = regexp.MustCompile(`^(.+)\[(\d+)\]\.md$`)
 
+// newIssueFilenameRegex matches new issue filenames in the format: title[new].md
+var newIssueFilenameRegex = regexp.MustCompile(`^(.+)\[new\]\.md$`)
+
 // sanitizeTitle converts an issue title to a filesystem-safe filename component.
 // It lowercases, replaces spaces with dashes, removes special characters,
 // and truncates to maxTitleLength characters.
@@ -106,6 +109,31 @@ func parseFilename(name string) (int, bool) {
 	}
 
 	return number, true
+}
+
+// parseNewIssueFilename checks if a filename is for a new issue (title[new].md format).
+// Returns the title portion and true if it matches, or empty string and false if not.
+func parseNewIssueFilename(name string) (string, bool) {
+	matches := newIssueFilenameRegex.FindStringSubmatch(name)
+	if matches == nil || len(matches) < 2 {
+		return "", false
+	}
+	return matches[1], true
+}
+
+// unsanitizeTitle converts a sanitized filename back to a human-readable title.
+// It replaces dashes with spaces and capitalizes each word.
+func unsanitizeTitle(sanitized string) string {
+	// Replace dashes with spaces
+	title := strings.ReplaceAll(sanitized, "-", " ")
+	// Capitalize first letter of each word
+	words := strings.Fields(title)
+	for i, word := range words {
+		if len(word) > 0 {
+			words[i] = strings.ToUpper(string(word[0])) + word[1:]
+		}
+	}
+	return strings.Join(words, " ")
 }
 
 // FS represents the FUSE filesystem for GitHub issues.
@@ -194,6 +222,7 @@ type rootNode struct {
 
 var _ = (fs.NodeReaddirer)((*rootNode)(nil))
 var _ = (fs.NodeLookuper)((*rootNode)(nil))
+var _ = (fs.NodeCreater)((*rootNode)(nil))
 
 // Readdir returns the list of issue files in the directory.
 func (r *rootNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
@@ -265,6 +294,256 @@ func (r *rootNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) 
 	child := r.NewInode(ctx, fileNode, stable)
 	return child, 0
 }
+
+// Create creates a new file for a new issue.
+// The filename must be in the format: title[new].md
+func (r *rootNode) Create(ctx context.Context, name string, flags uint32, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
+	// Check if this is a new issue file
+	titlePart, ok := parseNewIssueFilename(name)
+	if !ok {
+		// Not a valid new issue filename
+		return nil, nil, 0, syscall.EINVAL
+	}
+
+	// Convert sanitized title back to a readable title
+	title := unsanitizeTitle(titlePart)
+
+	// Create a new issue file node
+	// We use a negative number to indicate a pending issue (not yet created on GitHub)
+	pendingID := -int(time.Now().UnixNano() % 1000000) // Unique negative ID
+
+	fileNode := &newIssueFileNode{
+		cache:   r.cache,
+		repo:    r.repo,
+		title:   title,
+		onDirty: r.onDirty,
+	}
+
+	// Create the inode with a unique ID
+	stable := fs.StableAttr{
+		Mode: fuse.S_IFREG,
+		Ino:  uint64(uint32(pendingID) + 0x80000000), // High bit to avoid collision
+	}
+
+	child := r.NewInode(ctx, fileNode, stable)
+
+	// Generate initial content template
+	template := fmt.Sprintf(`---
+repo: %s
+state: open
+labels: []
+---
+
+# %s
+
+## Body
+
+`, r.repo, title)
+
+	handle := &newIssueFileHandle{
+		cache:   r.cache,
+		repo:    r.repo,
+		title:   title,
+		buffer:  []byte(template),
+		dirty:   true,
+		onDirty: r.onDirty,
+	}
+
+	// Set file attributes
+	out.Mode = 0644
+	out.Size = uint64(len(template))
+	now := time.Now()
+	out.SetTimes(&now, &now, &now)
+
+	return child, handle, fuse.FOPEN_DIRECT_IO, 0
+}
+
+// newIssueFileNode represents a new issue file that hasn't been created on GitHub yet.
+type newIssueFileNode struct {
+	fs.Inode
+	cache   *cache.DB
+	repo    string
+	title   string
+	onDirty func()
+}
+
+var _ = (fs.NodeGetattrer)((*newIssueFileNode)(nil))
+var _ = (fs.NodeOpener)((*newIssueFileNode)(nil))
+var _ = (fs.NodeReader)((*newIssueFileNode)(nil))
+var _ = (fs.NodeWriter)((*newIssueFileNode)(nil))
+var _ = (fs.NodeFlusher)((*newIssueFileNode)(nil))
+var _ = (fs.NodeSetattrer)((*newIssueFileNode)(nil))
+
+// Getattr returns file attributes for a new issue file.
+func (f *newIssueFileNode) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
+	// New issue file - return minimal attributes
+	out.Mode = 0644
+	out.Size = 0
+	now := time.Now()
+	out.SetTimes(&now, &now, &now)
+	return 0
+}
+
+// Setattr handles attribute changes for a new issue file.
+func (f *newIssueFileNode) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
+	if handle, ok := fh.(*newIssueFileHandle); ok {
+		if sz, ok := in.GetSize(); ok {
+			handle.mu.Lock()
+			if sz == 0 {
+				handle.buffer = []byte{}
+			} else if int(sz) < len(handle.buffer) {
+				handle.buffer = handle.buffer[:sz]
+			}
+			handle.dirty = true
+			out.Size = uint64(len(handle.buffer))
+			handle.mu.Unlock()
+		}
+	}
+
+	out.Mode = 0644
+	now := time.Now()
+	out.SetTimes(&now, &now, &now)
+	return 0
+}
+
+// Open opens a new issue file.
+func (f *newIssueFileNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
+	// Generate initial template
+	template := fmt.Sprintf(`---
+repo: %s
+state: open
+labels: []
+---
+
+# %s
+
+## Body
+
+`, f.repo, f.title)
+
+	handle := &newIssueFileHandle{
+		cache:   f.cache,
+		repo:    f.repo,
+		title:   f.title,
+		buffer:  []byte(template),
+		dirty:   false,
+		onDirty: f.onDirty,
+	}
+
+	return handle, fuse.FOPEN_DIRECT_IO, 0
+}
+
+// Read reads from a new issue file.
+func (f *newIssueFileNode) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
+	handle, ok := fh.(*newIssueFileHandle)
+	if !ok {
+		return nil, syscall.EBADF
+	}
+
+	handle.mu.Lock()
+	defer handle.mu.Unlock()
+
+	if off >= int64(len(handle.buffer)) {
+		return fuse.ReadResultData(nil), 0
+	}
+
+	end := off + int64(len(dest))
+	if end > int64(len(handle.buffer)) {
+		end = int64(len(handle.buffer))
+	}
+
+	return fuse.ReadResultData(handle.buffer[off:end]), 0
+}
+
+// Write writes to a new issue file.
+func (f *newIssueFileNode) Write(ctx context.Context, fh fs.FileHandle, data []byte, off int64) (uint32, syscall.Errno) {
+	handle, ok := fh.(*newIssueFileHandle)
+	if !ok {
+		return 0, syscall.EBADF
+	}
+
+	handle.mu.Lock()
+	defer handle.mu.Unlock()
+
+	endPos := int(off) + len(data)
+	if endPos > maxFileSize {
+		return 0, syscall.EFBIG
+	}
+
+	if endPos > len(handle.buffer) {
+		newBuf := make([]byte, endPos)
+		copy(newBuf, handle.buffer)
+		handle.buffer = newBuf
+	}
+
+	copy(handle.buffer[off:], data)
+	handle.dirty = true
+
+	return uint32(len(data)), 0
+}
+
+// Flush is called when a new issue file is closed.
+func (f *newIssueFileNode) Flush(ctx context.Context, fh fs.FileHandle) syscall.Errno {
+	handle, ok := fh.(*newIssueFileHandle)
+	if !ok {
+		return 0
+	}
+
+	handle.mu.Lock()
+	defer handle.mu.Unlock()
+
+	if !handle.dirty {
+		return 0
+	}
+
+	// Parse the content
+	content := string(handle.buffer)
+	parsed, err := md.FromMarkdown(content)
+	if err != nil {
+		logger.Warn("failed to parse new issue markdown: %v", err)
+		return syscall.EIO
+	}
+
+	// Extract labels from frontmatter (if any)
+	// For now, we don't parse labels from frontmatter (would need to extend ParsedIssue)
+	// Just use empty labels
+	var labels []string
+
+	// Get title and body from parsed content
+	title := parsed.Title
+	if title == "" {
+		title = f.title // Fallback to filename-derived title
+	}
+	body := parsed.Body
+
+	// Add to pending issues
+	_, err = f.cache.AddPendingIssue(f.repo, title, body, labels)
+	if err != nil {
+		logger.Warn("failed to add pending issue: %v", err)
+		return syscall.EIO
+	}
+
+	// Trigger sync
+	if f.onDirty != nil {
+		f.onDirty()
+	}
+
+	handle.dirty = false
+	return 0
+}
+
+// newIssueFileHandle represents an open file handle for a new issue.
+type newIssueFileHandle struct {
+	cache   *cache.DB
+	repo    string
+	title   string
+	buffer  []byte
+	dirty   bool
+	onDirty func()
+	mu      sync.Mutex
+}
+
+var _ = (fs.FileHandle)((*newIssueFileHandle)(nil))
 
 // issueFileNode represents a single issue file.
 type issueFileNode struct {
@@ -501,6 +780,9 @@ func (f *issueFileNode) Flush(ctx context.Context, fh fs.FileHandle) syscall.Err
 	// Detect changes
 	changes := md.DetectChanges(original, parsed)
 
+	// Track if we need to trigger sync
+	needsSync := false
+
 	// If title or body changed, mark dirty in cache
 	if changes.TitleChanged || changes.BodyChanged {
 		var titlePtr, bodyPtr *string
@@ -514,10 +796,40 @@ func (f *issueFileNode) Flush(ctx context.Context, fh fs.FileHandle) syscall.Err
 		if err != nil {
 			return syscall.EIO
 		}
-		// Trigger sync engine callback if set
-		if handle.onDirty != nil {
-			handle.onDirty()
+		needsSync = true
+	}
+
+	// Handle comment changes
+	originalComments, err := f.cache.GetComments(f.repo, f.number)
+	if err != nil {
+		originalComments = []cache.Comment{}
+	}
+
+	newComments, editedComments := md.DetectCommentChanges(originalComments, parsed.Comments)
+
+	// Add new comments to pending
+	for _, nc := range newComments {
+		err := f.cache.AddPendingComment(f.repo, f.number, nc.Body)
+		if err != nil {
+			logger.Warn("failed to add pending comment for issue #%d: %v", f.number, err)
+		} else {
+			needsSync = true
 		}
+	}
+
+	// Mark edited comments as dirty
+	for _, ec := range editedComments {
+		err := f.cache.MarkCommentDirty(f.repo, ec.ID, ec.NewBody)
+		if err != nil {
+			logger.Warn("failed to mark comment %d as dirty: %v", ec.ID, err)
+		} else {
+			needsSync = true
+		}
+	}
+
+	// Trigger sync engine callback if changes were made
+	if needsSync && handle.onDirty != nil {
+		handle.onDirty()
 	}
 
 	handle.dirty = false

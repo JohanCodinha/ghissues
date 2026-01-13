@@ -1106,6 +1106,261 @@ Content without a title heading`
 	}
 }
 
+// Test comment parsing from markdown
+
+func TestFromMarkdown_ParsesCommentsCorrectly(t *testing.T) {
+	content := `---
+id: 1
+repo: owner/repo
+---
+
+# Title
+
+## Body
+
+Issue body here.
+
+## Comments
+
+### 2026-01-10T14:12:00Z - alice
+<!-- comment_id: 987654 -->
+
+First comment body.
+
+### 2026-01-10T16:03:00Z - bob
+<!-- comment_id: 987655 -->
+
+Second comment body.
+`
+	parsed, err := FromMarkdown(content)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(parsed.Comments) != 2 {
+		t.Fatalf("expected 2 comments, got %d", len(parsed.Comments))
+	}
+
+	// Check first comment
+	if parsed.Comments[0].ID != 987654 {
+		t.Errorf("expected first comment ID 987654, got %d", parsed.Comments[0].ID)
+	}
+	if parsed.Comments[0].Author != "alice" {
+		t.Errorf("expected first comment author 'alice', got %q", parsed.Comments[0].Author)
+	}
+	if parsed.Comments[0].Body != "First comment body." {
+		t.Errorf("expected first comment body 'First comment body.', got %q", parsed.Comments[0].Body)
+	}
+	if parsed.Comments[0].IsNew {
+		t.Error("first comment should not be marked as new")
+	}
+
+	// Check second comment
+	if parsed.Comments[1].ID != 987655 {
+		t.Errorf("expected second comment ID 987655, got %d", parsed.Comments[1].ID)
+	}
+	if parsed.Comments[1].Author != "bob" {
+		t.Errorf("expected second comment author 'bob', got %q", parsed.Comments[1].Author)
+	}
+}
+
+func TestFromMarkdown_ParsesNewCommentMarker(t *testing.T) {
+	content := `---
+id: 1
+repo: owner/repo
+---
+
+# Title
+
+## Body
+
+Issue body.
+
+## Comments
+
+### 2026-01-10T14:12:00Z - alice
+<!-- comment_id: 987654 -->
+
+Existing comment.
+
+### new
+<!-- comment_id: new -->
+
+This is a new comment I'm adding.
+`
+	parsed, err := FromMarkdown(content)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(parsed.Comments) != 2 {
+		t.Fatalf("expected 2 comments, got %d", len(parsed.Comments))
+	}
+
+	// First comment should be existing
+	if parsed.Comments[0].IsNew {
+		t.Error("first comment should not be marked as new")
+	}
+	if parsed.Comments[0].ID != 987654 {
+		t.Errorf("expected first comment ID 987654, got %d", parsed.Comments[0].ID)
+	}
+
+	// Second comment should be new
+	if !parsed.Comments[1].IsNew {
+		t.Error("second comment should be marked as new")
+	}
+	if parsed.Comments[1].ID != 0 {
+		t.Errorf("expected new comment ID 0, got %d", parsed.Comments[1].ID)
+	}
+	if parsed.Comments[1].Body != "This is a new comment I'm adding." {
+		t.Errorf("expected new comment body, got %q", parsed.Comments[1].Body)
+	}
+}
+
+func TestFromMarkdown_ParsesMultilineCommentBody(t *testing.T) {
+	content := `---
+id: 1
+repo: owner/repo
+---
+
+# Title
+
+## Body
+
+Issue body.
+
+## Comments
+
+### 2026-01-10T14:12:00Z - alice
+<!-- comment_id: 100 -->
+
+First paragraph.
+
+Second paragraph.
+
+Third paragraph.
+`
+	parsed, err := FromMarkdown(content)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(parsed.Comments) != 1 {
+		t.Fatalf("expected 1 comment, got %d", len(parsed.Comments))
+	}
+
+	expected := "First paragraph.\n\nSecond paragraph.\n\nThird paragraph."
+	if parsed.Comments[0].Body != expected {
+		t.Errorf("expected multiline comment body:\n%q\ngot:\n%q", expected, parsed.Comments[0].Body)
+	}
+}
+
+func TestFromMarkdown_NoCommentsSection(t *testing.T) {
+	content := `---
+id: 1
+repo: owner/repo
+---
+
+# Title
+
+## Body
+
+Issue body without comments section.
+`
+	parsed, err := FromMarkdown(content)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(parsed.Comments) != 0 {
+		t.Errorf("expected 0 comments when no ## Comments section, got %d", len(parsed.Comments))
+	}
+}
+
+func TestDetectCommentChanges_IdentifiesNewComments(t *testing.T) {
+	originalComments := []cache.Comment{
+		{ID: 100, Body: "Existing comment"},
+	}
+
+	parsedComments := []ParsedComment{
+		{ID: 100, Body: "Existing comment", IsNew: false},
+		{ID: 0, Body: "New comment body", IsNew: true},
+	}
+
+	newComments, editedComments := DetectCommentChanges(originalComments, parsedComments)
+
+	if len(newComments) != 1 {
+		t.Errorf("expected 1 new comment, got %d", len(newComments))
+	}
+	if newComments[0].Body != "New comment body" {
+		t.Errorf("expected new comment body 'New comment body', got %q", newComments[0].Body)
+	}
+
+	if len(editedComments) != 0 {
+		t.Errorf("expected 0 edited comments, got %d", len(editedComments))
+	}
+}
+
+func TestDetectCommentChanges_IdentifiesEditedComments(t *testing.T) {
+	originalComments := []cache.Comment{
+		{ID: 100, Body: "Original body"},
+		{ID: 101, Body: "Unchanged body"},
+	}
+
+	parsedComments := []ParsedComment{
+		{ID: 100, Body: "Modified body", IsNew: false},
+		{ID: 101, Body: "Unchanged body", IsNew: false},
+	}
+
+	newComments, editedComments := DetectCommentChanges(originalComments, parsedComments)
+
+	if len(newComments) != 0 {
+		t.Errorf("expected 0 new comments, got %d", len(newComments))
+	}
+
+	if len(editedComments) != 1 {
+		t.Errorf("expected 1 edited comment, got %d", len(editedComments))
+	}
+	if editedComments[0].ID != 100 {
+		t.Errorf("expected edited comment ID 100, got %d", editedComments[0].ID)
+	}
+	if editedComments[0].NewBody != "Modified body" {
+		t.Errorf("expected new body 'Modified body', got %q", editedComments[0].NewBody)
+	}
+}
+
+func TestDetectCommentChanges_IgnoresEmptyNewComments(t *testing.T) {
+	originalComments := []cache.Comment{}
+
+	parsedComments := []ParsedComment{
+		{ID: 0, Body: "", IsNew: true},
+		{ID: 0, Body: "   ", IsNew: true},
+		{ID: 0, Body: "Valid new comment", IsNew: true},
+	}
+
+	newComments, _ := DetectCommentChanges(originalComments, parsedComments)
+
+	if len(newComments) != 1 {
+		t.Errorf("expected 1 new comment (non-empty), got %d", len(newComments))
+	}
+}
+
+func TestDetectCommentChanges_TrailingNewlineNormalization(t *testing.T) {
+	originalComments := []cache.Comment{
+		{ID: 100, Body: "Comment body\n"},
+	}
+
+	parsedComments := []ParsedComment{
+		{ID: 100, Body: "Comment body", IsNew: false},
+	}
+
+	_, editedComments := DetectCommentChanges(originalComments, parsedComments)
+
+	if len(editedComments) != 0 {
+		t.Error("trailing newline difference should not count as a change")
+	}
+}
+
 func TestFromMarkdown_ParseFailureScenarios(t *testing.T) {
 	// Comprehensive test of various parse failure scenarios
 	tests := []struct {
