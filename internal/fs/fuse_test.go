@@ -2061,3 +2061,199 @@ func TestIssueFileNode_Write_JustOverMaxFileSize(t *testing.T) {
 		t.Errorf("expected 0 bytes written on EFBIG error, got %d", written)
 	}
 }
+
+// TestIssueFileNode_Flush_MalformedContent tests that flush returns EIO
+// when the content cannot be parsed (broken template).
+func TestIssueFileNode_Flush_MalformedContent(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+	}{
+		{
+			name:    "missing frontmatter",
+			content: "# Title\n\n## Body\n\nContent without frontmatter",
+		},
+		{
+			name:    "malformed yaml - unclosed bracket",
+			content: "---\nid: [invalid\nrepo: test/repo\n---\n\n# Title\n\n## Body\n\nContent",
+		},
+		{
+			name:    "unclosed frontmatter",
+			content: "---\nid: 1\nrepo: test/repo\n\n# Title\n\n## Body\n\nMissing closing delimiter",
+		},
+		{
+			name:    "invalid id type in yaml",
+			content: "---\nid: not_a_number\nrepo: test/repo\n---\n\n# Title\n\n## Body\n\nContent",
+		},
+		{
+			name:    "frontmatter not at start",
+			content: "\n---\nid: 1\nrepo: test/repo\n---\n\n# Title\n\n## Body\n\nContent",
+		},
+	}
+
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Create fresh database for each subtest to ensure isolation
+			db, _ := setupTestCache(t)
+			defer db.Close()
+
+			repo := "test/repo"
+			issueNum := 100 + i // Use unique issue number per test
+			issues := []cache.Issue{
+				{Number: issueNum, Title: "Test Issue", Body: "Original body", State: "open", Author: "testuser"},
+			}
+			populateTestIssues(t, db, repo, issues)
+
+			var onDirtyCalled bool
+			onDirty := func() { onDirtyCalled = true }
+
+			fileNode := &issueFileNode{
+				cache:   db,
+				repo:    repo,
+				number:  issueNum,
+				onDirty: onDirty,
+			}
+
+			ctx := context.Background()
+
+			// Open the file
+			fh, _, errno := fileNode.Open(ctx, 0)
+			if errno != 0 {
+				t.Fatalf("Open returned error: %v", errno)
+			}
+
+			handle := fh.(*issueFileHandle)
+
+			// Replace buffer with malformed content
+			handle.buffer = []byte(tc.content)
+			handle.dirty = true
+
+			// Flush should return EIO
+			errno = fileNode.Flush(ctx, fh)
+			if errno != syscall.EIO {
+				t.Errorf("Flush with %s should return EIO, got %v", tc.name, errno)
+			}
+
+			// Verify onDirty callback was NOT called
+			if onDirtyCalled {
+				t.Error("onDirty callback should not have been called on parse failure")
+			}
+
+			// Verify issue is NOT marked dirty in cache (still has original values)
+			issue, err := db.GetIssue(repo, issueNum)
+			if err != nil {
+				t.Fatalf("failed to get issue: %v", err)
+			}
+			if issue.Dirty {
+				t.Error("issue should NOT be marked dirty in cache after parse failure")
+			}
+			if issue.Body != "Original body" {
+				t.Errorf("issue body should be unchanged, got %q", issue.Body)
+			}
+			if issue.Title != "Test Issue" {
+				t.Errorf("issue title should be unchanged, got %q", issue.Title)
+			}
+		})
+	}
+}
+
+// TestIssueFileNode_Flush_MalformedContent_PartiallyBroken tests flush with subtly broken content.
+func TestIssueFileNode_Flush_MalformedContent_PartiallyBroken(t *testing.T) {
+	db, _ := setupTestCache(t)
+	defer db.Close()
+
+	repo := "test/repo"
+	issues := []cache.Issue{
+		{Number: 1, Title: "Test Issue", Body: "Original body", State: "open", Author: "testuser"},
+	}
+	populateTestIssues(t, db, repo, issues)
+
+	tests := []struct {
+		name        string
+		content     string
+		shouldError bool
+	}{
+		{
+			// Valid content should work
+			name: "valid content",
+			content: `---
+id: 1
+repo: test/repo
+---
+
+# Updated Title
+
+## Body
+
+Updated body content`,
+			shouldError: false,
+		},
+		{
+			// Missing ## Body section should still parse (body will be empty)
+			name: "missing body section",
+			content: `---
+id: 1
+repo: test/repo
+---
+
+# Title Without Body Section
+
+Some content here but no ## Body section`,
+			shouldError: false,
+		},
+		{
+			// Extra whitespace in frontmatter should work
+			name: "extra whitespace",
+			content: `---
+id: 1
+repo: test/repo
+
+---
+
+# Title
+
+## Body
+
+Body content`,
+			shouldError: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fileNode := &issueFileNode{
+				cache:   db,
+				repo:    repo,
+				number:  1,
+				onDirty: func() {},
+			}
+
+			ctx := context.Background()
+
+			// Open the file
+			fh, _, errno := fileNode.Open(ctx, 0)
+			if errno != 0 {
+				t.Fatalf("Open returned error: %v", errno)
+			}
+
+			handle := fh.(*issueFileHandle)
+
+			// Replace buffer with test content
+			handle.buffer = []byte(tc.content)
+			handle.dirty = true
+
+			// Flush
+			errno = fileNode.Flush(ctx, fh)
+
+			if tc.shouldError {
+				if errno != syscall.EIO {
+					t.Errorf("expected EIO, got %v", errno)
+				}
+			} else {
+				if errno != 0 {
+					t.Errorf("expected success, got error %v", errno)
+				}
+			}
+		})
+	}
+}

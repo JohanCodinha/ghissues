@@ -1004,3 +1004,200 @@ End of body.
 		t.Error("content after code block should be preserved")
 	}
 }
+
+// Parse failure scenario tests for malformed templates
+
+func TestFromMarkdown_ErrorOnUnclosedFrontmatter(t *testing.T) {
+	content := `---
+id: 1
+repo: test/repo
+
+# Title
+
+## Body
+
+Content with only opening frontmatter delimiter`
+
+	_, err := FromMarkdown(content)
+	if err == nil {
+		t.Error("expected error when frontmatter has only opening delimiter")
+	}
+	if !strings.Contains(err.Error(), "closing") {
+		t.Errorf("error should mention missing closing delimiter, got: %v", err)
+	}
+}
+
+func TestFromMarkdown_ErrorOnEmptyContent(t *testing.T) {
+	_, err := FromMarkdown("")
+	if err == nil {
+		t.Error("expected error for empty content")
+	}
+}
+
+func TestFromMarkdown_ErrorOnOnlyWhitespace(t *testing.T) {
+	_, err := FromMarkdown("   \n\n   \t\n")
+	if err == nil {
+		t.Error("expected error for whitespace-only content")
+	}
+}
+
+func TestFromMarkdown_ErrorOnArrayInId(t *testing.T) {
+	content := `---
+id: [1, 2, 3]
+repo: test/repo
+---
+
+# Title
+
+## Body
+
+Content`
+
+	_, err := FromMarkdown(content)
+	if err == nil {
+		t.Error("expected error when id is an array instead of integer")
+	}
+}
+
+func TestFromMarkdown_ErrorOnNestedYamlInFrontmatter(t *testing.T) {
+	content := `---
+id:
+  nested:
+    value: 1
+repo: test/repo
+---
+
+# Title
+
+## Body
+
+Content`
+
+	_, err := FromMarkdown(content)
+	if err == nil {
+		t.Error("expected error when id has nested structure instead of integer")
+	}
+}
+
+func TestFromMarkdown_MissingTitleLine(t *testing.T) {
+	// Missing title (# heading) should still parse but title will be empty
+	content := `---
+id: 1
+repo: test/repo
+---
+
+## Body
+
+Content without a title heading`
+
+	parsed, err := FromMarkdown(content)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Title should be empty when no # heading is found
+	if parsed.Title != "" {
+		t.Errorf("expected empty title when # heading is missing, got %q", parsed.Title)
+	}
+
+	// Body should still be parsed
+	if !strings.Contains(parsed.Body, "Content without a title heading") {
+		t.Error("body content should still be extracted")
+	}
+}
+
+func TestFromMarkdown_ParseFailureScenarios(t *testing.T) {
+	// Comprehensive test of various parse failure scenarios
+	tests := []struct {
+		name        string
+		content     string
+		shouldError bool
+		errContains string
+	}{
+		{
+			name:        "missing frontmatter entirely",
+			content:     "# Title\n\n## Body\n\nContent",
+			shouldError: true,
+			errContains: "frontmatter",
+		},
+		{
+			name:        "frontmatter not at start",
+			content:     "\n---\nid: 1\nrepo: test/repo\n---\n\n# Title",
+			shouldError: true,
+			errContains: "frontmatter",
+		},
+		{
+			name:        "malformed yaml - unclosed bracket",
+			content:     "---\nid: [1\nrepo: test/repo\n---\n\n# Title",
+			shouldError: true,
+			errContains: "YAML",
+		},
+		{
+			name:        "malformed yaml - unclosed brace",
+			content:     "---\nid: {key: value\nrepo: test/repo\n---\n\n# Title",
+			shouldError: true,
+			errContains: "YAML",
+		},
+		{
+			name:        "id as string instead of int",
+			content:     "---\nid: not_a_number\nrepo: test/repo\n---\n\n# Title",
+			shouldError: true,
+			errContains: "",
+		},
+		{
+			// Note: YAML library silently truncates floats to int (1.5 -> 1)
+			// This is valid behavior, so we don't expect an error
+			name:        "id as float (truncated to int)",
+			content:     "---\nid: 1.5\nrepo: test/repo\n---\n\n# Title",
+			shouldError: false,
+		},
+		{
+			name: "valid minimal content",
+			content: `---
+id: 1
+repo: test/repo
+---
+
+# Title
+
+## Body
+
+Content`,
+			shouldError: false,
+		},
+		{
+			name: "valid with empty fields",
+			content: `---
+id: 0
+repo: ""
+---
+
+#
+
+## Body
+
+`,
+			shouldError: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := FromMarkdown(tc.content)
+
+			if tc.shouldError {
+				if err == nil {
+					t.Errorf("expected error for %s, but got nil", tc.name)
+					return
+				}
+				if tc.errContains != "" && !strings.Contains(err.Error(), tc.errContains) {
+					t.Errorf("error should contain %q, got: %v", tc.errContains, err)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("unexpected error for %s: %v", tc.name, err)
+				}
+			}
+		})
+	}
+}

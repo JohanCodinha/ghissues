@@ -99,6 +99,49 @@ Application crashes immediately after login...
 
 Edit the `## Body` section and save. Changes sync back to GitHub automatically (debounced 500ms after save).
 
+## File Format Requirements
+
+ghissues expects a specific markdown structure. Edits that break this structure will fail to save.
+
+### Required Structure
+
+```markdown
+---
+id: 1234
+repo: owner/repo
+# ... other frontmatter fields (do not modify)
+---
+
+# Issue Title
+
+## Body
+
+Your issue content here...
+
+## Comments
+
+(read-only section)
+```
+
+### What You Can Safely Edit
+
+- **Title**: Change the `# Title` line
+- **Body**: Edit content under `## Body`
+
+### What Will Cause Errors
+
+- Removing the `---` frontmatter delimiters
+- Modifying frontmatter fields (id, repo, etc.)
+- Malformed YAML in frontmatter (unclosed brackets, invalid types)
+
+Note: The `# Title` line and `## Body` section are optional for parsing, but removing them will result in empty title/body being saved.
+
+### Error Handling
+
+If you see an "Input/output error" when saving, your changes broke the expected format. The file will revert to its original content on next read.
+
+The canonical template is defined in `internal/md/format.go` (`ToMarkdown` function) and documented in `USER_STORY.md`.
+
 ### Unmount
 
 ```bash
