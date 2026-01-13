@@ -202,7 +202,7 @@ func (c *Client) ListIssues(owner, repo string) ([]Issue, error) {
 	for url != "" {
 		resp, err := c.doRequest("GET", url, nil)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to list issues for %s/%s: %w", owner, repo, err)
 		}
 
 		checkRateLimit(resp)
@@ -210,13 +210,13 @@ func (c *Client) ListIssues(owner, repo string) ([]Issue, error) {
 		if resp.StatusCode != http.StatusOK {
 			body, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			return nil, fmt.Errorf("GitHub API error: %s - %s", resp.Status, string(body))
+			return nil, fmt.Errorf("failed to list issues for %s/%s: API error %s - %s", owner, repo, resp.Status, string(body))
 		}
 
 		var issues []Issue
 		if err := json.NewDecoder(resp.Body).Decode(&issues); err != nil {
 			resp.Body.Close()
-			return nil, fmt.Errorf("failed to decode response: %w", err)
+			return nil, fmt.Errorf("failed to decode issues response for %s/%s: %w", owner, repo, err)
 		}
 
 		// Parse Link header for pagination before closing
@@ -255,7 +255,7 @@ func (c *Client) GetIssue(owner, repo string, number int) (*Issue, string, error
 
 	resp, err := c.doRequest("GET", url, nil)
 	if err != nil {
-		return nil, "", err
+		return nil, "", fmt.Errorf("failed to get issue #%d for %s/%s: %w", number, owner, repo, err)
 	}
 	defer resp.Body.Close()
 
@@ -263,12 +263,12 @@ func (c *Client) GetIssue(owner, repo string, number int) (*Issue, string, error
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, "", fmt.Errorf("GitHub API error: %s - %s", resp.Status, string(body))
+		return nil, "", fmt.Errorf("failed to get issue #%d for %s/%s: API error %s - %s", number, owner, repo, resp.Status, string(body))
 	}
 
 	var issue Issue
 	if err := json.NewDecoder(resp.Body).Decode(&issue); err != nil {
-		return nil, "", fmt.Errorf("failed to decode response: %w", err)
+		return nil, "", fmt.Errorf("failed to decode issue #%d response for %s/%s: %w", number, owner, repo, err)
 	}
 
 	etag := resp.Header.Get("ETag")
@@ -297,7 +297,7 @@ func (c *Client) UpdateIssue(owner, repo string, number int, title, body *string
 
 	resp, err := c.doRequest("PATCH", url, bytes.NewReader(jsonPayload))
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to update issue #%d for %s/%s: %w", number, owner, repo, err)
 	}
 	defer resp.Body.Close()
 
@@ -305,7 +305,7 @@ func (c *Client) UpdateIssue(owner, repo string, number int, title, body *string
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("GitHub API error: %s - %s", resp.Status, string(respBody))
+		return fmt.Errorf("failed to update issue #%d for %s/%s: API error %s - %s", number, owner, repo, resp.Status, string(respBody))
 	}
 
 	return nil
@@ -320,7 +320,7 @@ func (c *Client) ListComments(owner, repo string, number int) ([]Comment, error)
 	for url != "" {
 		resp, err := c.doRequest("GET", url, nil)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to list comments for issue #%d in %s/%s: %w", number, owner, repo, err)
 		}
 
 		checkRateLimit(resp)
@@ -328,13 +328,13 @@ func (c *Client) ListComments(owner, repo string, number int) ([]Comment, error)
 		if resp.StatusCode != http.StatusOK {
 			body, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			return nil, fmt.Errorf("GitHub API error: %s - %s", resp.Status, string(body))
+			return nil, fmt.Errorf("failed to list comments for issue #%d in %s/%s: API error %s - %s", number, owner, repo, resp.Status, string(body))
 		}
 
 		var comments []Comment
 		if err := json.NewDecoder(resp.Body).Decode(&comments); err != nil {
 			resp.Body.Close()
-			return nil, fmt.Errorf("failed to decode response: %w", err)
+			return nil, fmt.Errorf("failed to decode comments response for issue #%d in %s/%s: %w", number, owner, repo, err)
 		}
 
 		// Parse Link header for pagination before closing
@@ -362,7 +362,7 @@ func (c *Client) CreateComment(owner, repo string, number int, body string) (*Co
 
 	resp, err := c.doRequest("POST", url, bytes.NewReader(jsonPayload))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create comment on issue #%d in %s/%s: %w", number, owner, repo, err)
 	}
 	defer resp.Body.Close()
 
@@ -370,12 +370,12 @@ func (c *Client) CreateComment(owner, repo string, number int, body string) (*Co
 
 	if resp.StatusCode != http.StatusCreated {
 		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("GitHub API error: %s - %s", resp.Status, string(respBody))
+		return nil, fmt.Errorf("failed to create comment on issue #%d in %s/%s: API error %s - %s", number, owner, repo, resp.Status, string(respBody))
 	}
 
 	var comment Comment
 	if err := json.NewDecoder(resp.Body).Decode(&comment); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
+		return nil, fmt.Errorf("failed to decode comment response for issue #%d in %s/%s: %w", number, owner, repo, err)
 	}
 
 	return &comment, nil
@@ -393,7 +393,7 @@ func (c *Client) UpdateComment(owner, repo string, commentID int64, body string)
 
 	resp, err := c.doRequest("PATCH", url, bytes.NewReader(jsonPayload))
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to update comment %d in %s/%s: %w", commentID, owner, repo, err)
 	}
 	defer resp.Body.Close()
 
@@ -401,7 +401,7 @@ func (c *Client) UpdateComment(owner, repo string, commentID int64, body string)
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("GitHub API error: %s - %s", resp.Status, string(respBody))
+		return fmt.Errorf("failed to update comment %d in %s/%s: API error %s - %s", commentID, owner, repo, resp.Status, string(respBody))
 	}
 
 	return nil
@@ -427,7 +427,7 @@ func (c *Client) CreateIssue(owner, repo, title, body string, labels []string) (
 
 	resp, err := c.doRequest("POST", url, bytes.NewReader(jsonPayload))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create issue in %s/%s: %w", owner, repo, err)
 	}
 	defer resp.Body.Close()
 
@@ -435,12 +435,12 @@ func (c *Client) CreateIssue(owner, repo, title, body string, labels []string) (
 
 	if resp.StatusCode != http.StatusCreated {
 		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("GitHub API error: %s - %s", resp.Status, string(respBody))
+		return nil, fmt.Errorf("failed to create issue in %s/%s: API error %s - %s", owner, repo, resp.Status, string(respBody))
 	}
 
 	var issue Issue
 	if err := json.NewDecoder(resp.Body).Decode(&issue); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
+		return nil, fmt.Errorf("failed to decode created issue response for %s/%s: %w", owner, repo, err)
 	}
 
 	etag := resp.Header.Get("ETag")
@@ -471,7 +471,7 @@ func (c *Client) GetIssueWithEtag(owner, repo string, number int, etag string) (
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, "", fmt.Errorf("request failed: %w", err)
+		return nil, "", fmt.Errorf("failed to get issue #%d with etag for %s/%s: %w", number, owner, repo, err)
 	}
 	defer resp.Body.Close()
 
@@ -484,12 +484,12 @@ func (c *Client) GetIssueWithEtag(owner, repo string, number int, etag string) (
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, "", fmt.Errorf("GitHub API error: %s - %s", resp.Status, string(body))
+		return nil, "", fmt.Errorf("failed to get issue #%d with etag for %s/%s: API error %s - %s", number, owner, repo, resp.Status, string(body))
 	}
 
 	var issue Issue
 	if err := json.NewDecoder(resp.Body).Decode(&issue); err != nil {
-		return nil, "", fmt.Errorf("failed to decode response: %w", err)
+		return nil, "", fmt.Errorf("failed to decode issue #%d response for %s/%s: %w", number, owner, repo, err)
 	}
 
 	newEtag := resp.Header.Get("ETag")

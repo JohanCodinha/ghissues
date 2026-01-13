@@ -2,6 +2,7 @@ package fs
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -2253,6 +2254,1066 @@ Body content`,
 				if errno != 0 {
 					t.Errorf("expected success, got error %v", errno)
 				}
+			}
+		})
+	}
+}
+
+// =============================================================================
+// newIssueFileNode Tests
+// =============================================================================
+
+// TestParseNewIssueFilename tests the parseNewIssueFilename helper function.
+func TestParseNewIssueFilename(t *testing.T) {
+	tests := []struct {
+		name          string
+		filename      string
+		expectedTitle string
+		expectedOK    bool
+	}{
+		{
+			name:          "valid new issue filename",
+			filename:      "my-new-issue[new].md",
+			expectedTitle: "my-new-issue",
+			expectedOK:    true,
+		},
+		{
+			name:          "valid new issue with spaces converted",
+			filename:      "crash-on-startup[new].md",
+			expectedTitle: "crash-on-startup",
+			expectedOK:    true,
+		},
+		{
+			name:          "simple title",
+			filename:      "bug[new].md",
+			expectedTitle: "bug",
+			expectedOK:    true,
+		},
+		{
+			name:          "regular issue filename (not new)",
+			filename:      "bug[123].md",
+			expectedTitle: "",
+			expectedOK:    false,
+		},
+		{
+			name:          "missing [new]",
+			filename:      "bug.md",
+			expectedTitle: "",
+			expectedOK:    false,
+		},
+		{
+			name:          "wrong brackets content",
+			filename:      "bug[NEW].md", // uppercase NEW
+			expectedTitle: "",
+			expectedOK:    false,
+		},
+		{
+			name:          "empty title",
+			filename:      "[new].md",
+			expectedTitle: "",
+			expectedOK:    false,
+		},
+		{
+			name:          "missing extension",
+			filename:      "bug[new]",
+			expectedTitle: "",
+			expectedOK:    false,
+		},
+		{
+			name:          "wrong extension",
+			filename:      "bug[new].txt",
+			expectedTitle: "",
+			expectedOK:    false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			title, ok := parseNewIssueFilename(tc.filename)
+			if ok != tc.expectedOK {
+				t.Errorf("parseNewIssueFilename(%q) ok = %v, expected %v", tc.filename, ok, tc.expectedOK)
+			}
+			if title != tc.expectedTitle {
+				t.Errorf("parseNewIssueFilename(%q) title = %q, expected %q", tc.filename, title, tc.expectedTitle)
+			}
+		})
+	}
+}
+
+// TestUnsanitizeTitle tests the unsanitizeTitle helper function.
+func TestUnsanitizeTitle(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "simple dashes to spaces",
+			input:    "crash-on-startup",
+			expected: "Crash On Startup",
+		},
+		{
+			name:     "single word",
+			input:    "bug",
+			expected: "Bug",
+		},
+		{
+			name:     "multiple dashes",
+			input:    "fix-the-login-page-bug",
+			expected: "Fix The Login Page Bug",
+		},
+		{
+			name:     "empty string",
+			input:    "",
+			expected: "",
+		},
+		{
+			name:     "already clean",
+			input:    "test",
+			expected: "Test",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result := unsanitizeTitle(tc.input)
+			if result != tc.expected {
+				t.Errorf("unsanitizeTitle(%q) = %q, expected %q", tc.input, result, tc.expected)
+			}
+		})
+	}
+}
+
+// TestNewIssueFileNode_Getattr tests getting file attributes for a new issue file.
+func TestNewIssueFileNode_Getattr(t *testing.T) {
+	db, _ := setupTestCache(t)
+	defer db.Close()
+
+	fileNode := &newIssueFileNode{
+		cache: db,
+		repo:  "test/repo",
+		title: "Test New Issue",
+	}
+
+	ctx := context.Background()
+	out := &fuse.AttrOut{}
+	errno := fileNode.Getattr(ctx, nil, out)
+	if errno != 0 {
+		t.Fatalf("Getattr returned error: %v", errno)
+	}
+
+	// Verify mode
+	if out.Mode != 0644 {
+		t.Errorf("mode = %o, expected 0644", out.Mode)
+	}
+
+	// Verify size is 0 (no handle, so no buffer)
+	if out.Size != 0 {
+		t.Errorf("size = %d, expected 0", out.Size)
+	}
+}
+
+// TestNewIssueFileNode_Open tests opening a new issue file.
+func TestNewIssueFileNode_Open(t *testing.T) {
+	db, _ := setupTestCache(t)
+	defer db.Close()
+
+	repo := "test/repo"
+	title := "Test New Issue"
+
+	fileNode := &newIssueFileNode{
+		cache: db,
+		repo:  repo,
+		title: title,
+	}
+
+	ctx := context.Background()
+	fh, flags, errno := fileNode.Open(ctx, 0)
+	if errno != 0 {
+		t.Fatalf("Open returned error: %v", errno)
+	}
+	if fh == nil {
+		t.Fatal("Open returned nil file handle")
+	}
+
+	// Should use DIRECT_IO
+	if flags&fuse.FOPEN_DIRECT_IO == 0 {
+		t.Error("expected FOPEN_DIRECT_IO flag")
+	}
+
+	// Verify handle type
+	handle, ok := fh.(*newIssueFileHandle)
+	if !ok {
+		t.Fatal("expected *newIssueFileHandle type")
+	}
+
+	// Verify template content
+	content := string(handle.buffer)
+
+	// Should contain frontmatter
+	if !strings.Contains(content, "---") {
+		t.Error("template should contain frontmatter delimiters")
+	}
+	if !strings.Contains(content, "repo: "+repo) {
+		t.Errorf("template should contain repo: %s", repo)
+	}
+	if !strings.Contains(content, "state: open") {
+		t.Error("template should contain state: open")
+	}
+
+	// Should contain title
+	if !strings.Contains(content, "# "+title) {
+		t.Errorf("template should contain title: # %s", title)
+	}
+
+	// Should contain Body section
+	if !strings.Contains(content, "## Body") {
+		t.Error("template should contain ## Body section")
+	}
+}
+
+// TestNewIssueFileNode_Read tests reading from a new issue file.
+func TestNewIssueFileNode_Read(t *testing.T) {
+	db, _ := setupTestCache(t)
+	defer db.Close()
+
+	fileNode := &newIssueFileNode{
+		cache: db,
+		repo:  "test/repo",
+		title: "Read Test",
+	}
+
+	ctx := context.Background()
+
+	// Open the file
+	fh, _, errno := fileNode.Open(ctx, 0)
+	if errno != 0 {
+		t.Fatalf("Open returned error: %v", errno)
+	}
+
+	handle := fh.(*newIssueFileHandle)
+	bufferLen := len(handle.buffer)
+
+	// Read the entire content
+	dest := make([]byte, 4096)
+	result, errno := fileNode.Read(ctx, fh, dest, 0)
+	if errno != 0 {
+		t.Fatalf("Read returned error: %v", errno)
+	}
+
+	data, _ := result.Bytes(nil)
+	if len(data) != bufferLen {
+		t.Errorf("Read returned %d bytes, expected %d", len(data), bufferLen)
+	}
+}
+
+// TestNewIssueFileNode_Read_OffsetBeyondEnd tests reading at offset beyond buffer.
+func TestNewIssueFileNode_Read_OffsetBeyondEnd(t *testing.T) {
+	db, _ := setupTestCache(t)
+	defer db.Close()
+
+	fileNode := &newIssueFileNode{
+		cache: db,
+		repo:  "test/repo",
+		title: "Test",
+	}
+
+	ctx := context.Background()
+
+	// Open the file
+	fh, _, errno := fileNode.Open(ctx, 0)
+	if errno != 0 {
+		t.Fatalf("Open returned error: %v", errno)
+	}
+
+	handle := fh.(*newIssueFileHandle)
+
+	// Read beyond buffer
+	dest := make([]byte, 100)
+	result, errno := fileNode.Read(ctx, fh, dest, int64(len(handle.buffer)+100))
+	if errno != 0 {
+		t.Fatalf("Read returned error: %v", errno)
+	}
+
+	data, _ := result.Bytes(nil)
+	if len(data) != 0 {
+		t.Errorf("expected empty result, got %d bytes", len(data))
+	}
+}
+
+// TestNewIssueFileNode_Read_PartialRead tests reading part of the file.
+func TestNewIssueFileNode_Read_PartialRead(t *testing.T) {
+	db, _ := setupTestCache(t)
+	defer db.Close()
+
+	fileNode := &newIssueFileNode{
+		cache: db,
+		repo:  "test/repo",
+		title: "Partial Read Test",
+	}
+
+	ctx := context.Background()
+
+	// Open the file
+	fh, _, errno := fileNode.Open(ctx, 0)
+	if errno != 0 {
+		t.Fatalf("Open returned error: %v", errno)
+	}
+
+	handle := fh.(*newIssueFileHandle)
+
+	// Read 10 bytes starting at offset 5
+	dest := make([]byte, 10)
+	result, errno := fileNode.Read(ctx, fh, dest, 5)
+	if errno != 0 {
+		t.Fatalf("Read returned error: %v", errno)
+	}
+
+	data, _ := result.Bytes(nil)
+	expected := handle.buffer[5:15]
+	if string(data) != string(expected) {
+		t.Errorf("read data = %q, expected %q", string(data), string(expected))
+	}
+}
+
+// TestNewIssueFileNode_Read_NoHandle tests reading without a proper handle.
+func TestNewIssueFileNode_Read_NoHandle(t *testing.T) {
+	db, _ := setupTestCache(t)
+	defer db.Close()
+
+	fileNode := &newIssueFileNode{
+		cache: db,
+		repo:  "test/repo",
+		title: "Test",
+	}
+
+	ctx := context.Background()
+
+	// Read with nil handle
+	dest := make([]byte, 100)
+	_, errno := fileNode.Read(ctx, nil, dest, 0)
+	if errno != syscall.EBADF {
+		t.Errorf("expected EBADF, got %v", errno)
+	}
+}
+
+// TestNewIssueFileNode_Write tests writing to a new issue file.
+func TestNewIssueFileNode_Write(t *testing.T) {
+	db, _ := setupTestCache(t)
+	defer db.Close()
+
+	fileNode := &newIssueFileNode{
+		cache: db,
+		repo:  "test/repo",
+		title: "Write Test",
+	}
+
+	ctx := context.Background()
+
+	// Open the file
+	fh, _, errno := fileNode.Open(ctx, 0)
+	if errno != 0 {
+		t.Fatalf("Open returned error: %v", errno)
+	}
+
+	handle := fh.(*newIssueFileHandle)
+	initialLen := len(handle.buffer)
+
+	// Write new content at offset 0
+	newContent := []byte(`---
+repo: test/repo
+state: open
+labels: []
+---
+
+# Write Test
+
+## Body
+
+This is my new issue body content.
+`)
+
+	written, errno := fileNode.Write(ctx, fh, newContent, 0)
+	if errno != 0 {
+		t.Fatalf("Write returned error: %v", errno)
+	}
+	if int(written) != len(newContent) {
+		t.Errorf("Write returned %d, expected %d", written, len(newContent))
+	}
+
+	// Verify buffer was updated
+	if !strings.Contains(string(handle.buffer), "This is my new issue body content") {
+		t.Error("buffer should contain new content")
+	}
+
+	// Verify dirty flag is set
+	if !handle.dirty {
+		t.Error("dirty flag should be set after write")
+	}
+
+	// Buffer may have grown if new content is larger
+	if len(newContent) > initialLen && len(handle.buffer) != len(newContent) {
+		t.Errorf("buffer length = %d, expected %d", len(handle.buffer), len(newContent))
+	}
+}
+
+// TestNewIssueFileNode_Write_ExtendBuffer tests writing beyond buffer size.
+func TestNewIssueFileNode_Write_ExtendBuffer(t *testing.T) {
+	db, _ := setupTestCache(t)
+	defer db.Close()
+
+	fileNode := &newIssueFileNode{
+		cache: db,
+		repo:  "test/repo",
+		title: "Test",
+	}
+
+	ctx := context.Background()
+
+	// Open the file
+	fh, _, errno := fileNode.Open(ctx, 0)
+	if errno != 0 {
+		t.Fatalf("Open returned error: %v", errno)
+	}
+
+	handle := fh.(*newIssueFileHandle)
+	originalLen := len(handle.buffer)
+
+	// Write at an offset beyond current buffer
+	data := []byte("APPENDED DATA")
+	offset := int64(originalLen + 100)
+	written, errno := fileNode.Write(ctx, fh, data, offset)
+	if errno != 0 {
+		t.Fatalf("Write returned error: %v", errno)
+	}
+	if int(written) != len(data) {
+		t.Errorf("Write returned %d, expected %d", written, len(data))
+	}
+
+	// Buffer should have grown
+	expectedLen := int(offset) + len(data)
+	if len(handle.buffer) != expectedLen {
+		t.Errorf("buffer length = %d, expected %d", len(handle.buffer), expectedLen)
+	}
+}
+
+// TestNewIssueFileNode_Write_NoHandle tests writing without a proper handle.
+func TestNewIssueFileNode_Write_NoHandle(t *testing.T) {
+	db, _ := setupTestCache(t)
+	defer db.Close()
+
+	fileNode := &newIssueFileNode{
+		cache: db,
+		repo:  "test/repo",
+		title: "Test",
+	}
+
+	ctx := context.Background()
+
+	// Write with nil handle
+	_, errno := fileNode.Write(ctx, nil, []byte("test"), 0)
+	if errno != syscall.EBADF {
+		t.Errorf("expected EBADF, got %v", errno)
+	}
+}
+
+// TestNewIssueFileNode_Write_ExceedsMaxFileSize tests writing beyond max file size.
+func TestNewIssueFileNode_Write_ExceedsMaxFileSize(t *testing.T) {
+	db, _ := setupTestCache(t)
+	defer db.Close()
+
+	fileNode := &newIssueFileNode{
+		cache: db,
+		repo:  "test/repo",
+		title: "Test",
+	}
+
+	ctx := context.Background()
+
+	// Open the file
+	fh, _, errno := fileNode.Open(ctx, 0)
+	if errno != 0 {
+		t.Fatalf("Open returned error: %v", errno)
+	}
+
+	// Try to write at an offset that would exceed maxFileSize (10MB)
+	largeOffset := int64(maxFileSize - 100)
+	data := make([]byte, 200)
+
+	written, errno := fileNode.Write(ctx, fh, data, largeOffset)
+	if errno != syscall.EFBIG {
+		t.Errorf("Write beyond maxFileSize should return EFBIG, got errno=%v, written=%d", errno, written)
+	}
+}
+
+// TestNewIssueFileNode_Flush_ValidContent tests flush with valid new issue content.
+func TestNewIssueFileNode_Flush_ValidContent(t *testing.T) {
+	db, _ := setupTestCache(t)
+	defer db.Close()
+
+	repo := "test/repo"
+	title := "My New Issue"
+
+	var onDirtyCalled bool
+	onDirty := func() { onDirtyCalled = true }
+
+	fileNode := &newIssueFileNode{
+		cache:   db,
+		repo:    repo,
+		title:   title,
+		onDirty: onDirty,
+	}
+
+	ctx := context.Background()
+
+	// Open the file
+	fh, _, errno := fileNode.Open(ctx, 0)
+	if errno != 0 {
+		t.Fatalf("Open returned error: %v", errno)
+	}
+
+	handle := fh.(*newIssueFileHandle)
+
+	// Write valid content
+	content := `---
+repo: test/repo
+state: open
+labels: []
+---
+
+# My New Issue
+
+## Body
+
+This is the body of my new issue.
+`
+	handle.buffer = []byte(content)
+	handle.dirty = true
+
+	// Flush
+	errno = fileNode.Flush(ctx, fh)
+	if errno != 0 {
+		t.Fatalf("Flush returned error: %v", errno)
+	}
+
+	// Verify onDirty callback was called
+	if !onDirtyCalled {
+		t.Error("onDirty callback should have been called")
+	}
+
+	// Verify pending issue was added to cache
+	pendingIssues, err := db.GetPendingIssues(repo)
+	if err != nil {
+		t.Fatalf("GetPendingIssues failed: %v", err)
+	}
+
+	if len(pendingIssues) != 1 {
+		t.Fatalf("expected 1 pending issue, got %d", len(pendingIssues))
+	}
+
+	if pendingIssues[0].Title != "My New Issue" {
+		t.Errorf("pending issue title = %q, expected %q", pendingIssues[0].Title, "My New Issue")
+	}
+	if !strings.Contains(pendingIssues[0].Body, "This is the body of my new issue") {
+		t.Errorf("pending issue body should contain expected content, got %q", pendingIssues[0].Body)
+	}
+}
+
+// TestNewIssueFileNode_Flush_FallbackTitle tests flush using filename-derived title as fallback.
+func TestNewIssueFileNode_Flush_FallbackTitle(t *testing.T) {
+	db, _ := setupTestCache(t)
+	defer db.Close()
+
+	repo := "test/repo"
+	title := "Filename Derived Title"
+
+	fileNode := &newIssueFileNode{
+		cache:   db,
+		repo:    repo,
+		title:   title,
+		onDirty: func() {},
+	}
+
+	ctx := context.Background()
+
+	// Open the file
+	fh, _, errno := fileNode.Open(ctx, 0)
+	if errno != 0 {
+		t.Fatalf("Open returned error: %v", errno)
+	}
+
+	handle := fh.(*newIssueFileHandle)
+
+	// Write content with empty title (will fallback to filename-derived title)
+	content := `---
+repo: test/repo
+state: open
+labels: []
+---
+
+#
+
+## Body
+
+Body content here.
+`
+	handle.buffer = []byte(content)
+	handle.dirty = true
+
+	// Flush
+	errno = fileNode.Flush(ctx, fh)
+	if errno != 0 {
+		t.Fatalf("Flush returned error: %v", errno)
+	}
+
+	// Verify pending issue uses fallback title
+	pendingIssues, err := db.GetPendingIssues(repo)
+	if err != nil {
+		t.Fatalf("GetPendingIssues failed: %v", err)
+	}
+
+	if len(pendingIssues) != 1 {
+		t.Fatalf("expected 1 pending issue, got %d", len(pendingIssues))
+	}
+
+	// Should use the filename-derived title as fallback
+	if pendingIssues[0].Title != title {
+		t.Errorf("pending issue title = %q, expected fallback %q", pendingIssues[0].Title, title)
+	}
+}
+
+// TestNewIssueFileNode_Flush_NotDirty tests flush when content is not dirty.
+func TestNewIssueFileNode_Flush_NotDirty(t *testing.T) {
+	db, _ := setupTestCache(t)
+	defer db.Close()
+
+	var onDirtyCalled bool
+	onDirty := func() { onDirtyCalled = true }
+
+	fileNode := &newIssueFileNode{
+		cache:   db,
+		repo:    "test/repo",
+		title:   "Test",
+		onDirty: onDirty,
+	}
+
+	ctx := context.Background()
+
+	// Open the file
+	fh, _, errno := fileNode.Open(ctx, 0)
+	if errno != 0 {
+		t.Fatalf("Open returned error: %v", errno)
+	}
+
+	// Don't set dirty flag (leave it as default false from Open)
+
+	// Flush
+	errno = fileNode.Flush(ctx, fh)
+	if errno != 0 {
+		t.Fatalf("Flush returned error: %v", errno)
+	}
+
+	// Verify onDirty callback was NOT called
+	if onDirtyCalled {
+		t.Error("onDirty callback should not have been called when not dirty")
+	}
+
+	// Verify no pending issues were added
+	pendingIssues, err := db.GetPendingIssues("test/repo")
+	if err != nil {
+		t.Fatalf("GetPendingIssues failed: %v", err)
+	}
+
+	if len(pendingIssues) != 0 {
+		t.Errorf("expected 0 pending issues, got %d", len(pendingIssues))
+	}
+}
+
+// TestNewIssueFileNode_Flush_NoHandle tests flush without a proper handle.
+func TestNewIssueFileNode_Flush_NoHandle(t *testing.T) {
+	db, _ := setupTestCache(t)
+	defer db.Close()
+
+	fileNode := &newIssueFileNode{
+		cache: db,
+		repo:  "test/repo",
+		title: "Test",
+	}
+
+	ctx := context.Background()
+
+	// Flush with nil handle should succeed (no-op)
+	errno := fileNode.Flush(ctx, nil)
+	if errno != 0 {
+		t.Errorf("Flush with nil handle should return 0, got %v", errno)
+	}
+}
+
+// TestNewIssueFileNode_Flush_MalformedContent tests flush with malformed content.
+func TestNewIssueFileNode_Flush_MalformedContent(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+	}{
+		{
+			name:    "missing frontmatter",
+			content: "# Title\n\n## Body\n\nContent without frontmatter",
+		},
+		{
+			name:    "unclosed frontmatter",
+			content: "---\nrepo: test/repo\n\n# Title\n\n## Body\n\nMissing closing delimiter",
+		},
+		{
+			name:    "malformed yaml",
+			content: "---\nrepo: [invalid\n---\n\n# Title\n\n## Body\n\nContent",
+		},
+		{
+			name:    "frontmatter not at start",
+			content: "\n---\nrepo: test/repo\n---\n\n# Title\n\n## Body\n\nContent",
+		},
+	}
+
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			db, _ := setupTestCache(t)
+			defer db.Close()
+
+			var onDirtyCalled bool
+			onDirty := func() { onDirtyCalled = true }
+
+			fileNode := &newIssueFileNode{
+				cache:   db,
+				repo:    "test/repo",
+				title:   fmt.Sprintf("Test %d", i),
+				onDirty: onDirty,
+			}
+
+			ctx := context.Background()
+
+			// Open the file
+			fh, _, errno := fileNode.Open(ctx, 0)
+			if errno != 0 {
+				t.Fatalf("Open returned error: %v", errno)
+			}
+
+			handle := fh.(*newIssueFileHandle)
+			handle.buffer = []byte(tc.content)
+			handle.dirty = true
+
+			// Flush should return EIO for malformed content
+			errno = fileNode.Flush(ctx, fh)
+			if errno != syscall.EIO {
+				t.Errorf("Flush with %s should return EIO, got %v", tc.name, errno)
+			}
+
+			// Verify onDirty callback was NOT called
+			if onDirtyCalled {
+				t.Error("onDirty callback should not have been called on parse failure")
+			}
+
+			// Verify no pending issues were added
+			pendingIssues, err := db.GetPendingIssues("test/repo")
+			if err != nil {
+				t.Fatalf("GetPendingIssues failed: %v", err)
+			}
+			if len(pendingIssues) != 0 {
+				t.Errorf("expected 0 pending issues after parse failure, got %d", len(pendingIssues))
+			}
+		})
+	}
+}
+
+// TestNewIssueFileNode_Flush_EmptyContent tests flush with empty body content.
+func TestNewIssueFileNode_Flush_EmptyContent(t *testing.T) {
+	db, _ := setupTestCache(t)
+	defer db.Close()
+
+	fileNode := &newIssueFileNode{
+		cache:   db,
+		repo:    "test/repo",
+		title:   "Empty Body Issue",
+		onDirty: func() {},
+	}
+
+	ctx := context.Background()
+
+	// Open the file
+	fh, _, errno := fileNode.Open(ctx, 0)
+	if errno != 0 {
+		t.Fatalf("Open returned error: %v", errno)
+	}
+
+	handle := fh.(*newIssueFileHandle)
+
+	// Write content with empty body
+	content := `---
+repo: test/repo
+state: open
+labels: []
+---
+
+# Empty Body Issue
+
+## Body
+
+`
+	handle.buffer = []byte(content)
+	handle.dirty = true
+
+	// Flush should succeed even with empty body
+	errno = fileNode.Flush(ctx, fh)
+	if errno != 0 {
+		t.Fatalf("Flush returned error: %v", errno)
+	}
+
+	// Verify pending issue was added with empty body
+	pendingIssues, err := db.GetPendingIssues("test/repo")
+	if err != nil {
+		t.Fatalf("GetPendingIssues failed: %v", err)
+	}
+
+	if len(pendingIssues) != 1 {
+		t.Fatalf("expected 1 pending issue, got %d", len(pendingIssues))
+	}
+
+	if pendingIssues[0].Body != "" {
+		t.Errorf("expected empty body, got %q", pendingIssues[0].Body)
+	}
+}
+
+// TestNewIssueFileNode_Setattr tests attribute changes for new issue files.
+func TestNewIssueFileNode_Setattr(t *testing.T) {
+	db, _ := setupTestCache(t)
+	defer db.Close()
+
+	fileNode := &newIssueFileNode{
+		cache: db,
+		repo:  "test/repo",
+		title: "Setattr Test",
+	}
+
+	ctx := context.Background()
+
+	// Open the file
+	fh, _, errno := fileNode.Open(ctx, 0)
+	if errno != 0 {
+		t.Fatalf("Open returned error: %v", errno)
+	}
+
+	handle := fh.(*newIssueFileHandle)
+
+	t.Run("truncate to zero", func(t *testing.T) {
+		// Reset buffer
+		handle.buffer = []byte("some content here")
+		handle.dirty = false
+
+		in := &fuse.SetAttrIn{}
+		in.Valid = fuse.FATTR_SIZE
+		in.Size = 0
+
+		out := &fuse.AttrOut{}
+		errno := fileNode.Setattr(ctx, fh, in, out)
+		if errno != 0 {
+			t.Fatalf("Setattr returned error: %v", errno)
+		}
+
+		// Verify buffer is now empty
+		if len(handle.buffer) != 0 {
+			t.Errorf("buffer length = %d, expected 0", len(handle.buffer))
+		}
+
+		// Verify dirty flag is set
+		if !handle.dirty {
+			t.Error("dirty flag should be set after truncate")
+		}
+
+		// Verify reported size
+		if out.Size != 0 {
+			t.Errorf("reported size = %d, expected 0", out.Size)
+		}
+	})
+
+	t.Run("truncate to smaller size", func(t *testing.T) {
+		// Reset buffer
+		handle.buffer = []byte("some content here that is longer")
+		handle.dirty = false
+
+		in := &fuse.SetAttrIn{}
+		in.Valid = fuse.FATTR_SIZE
+		in.Size = 10
+
+		out := &fuse.AttrOut{}
+		errno := fileNode.Setattr(ctx, fh, in, out)
+		if errno != 0 {
+			t.Fatalf("Setattr returned error: %v", errno)
+		}
+
+		// Verify buffer is truncated
+		if len(handle.buffer) != 10 {
+			t.Errorf("buffer length = %d, expected 10", len(handle.buffer))
+		}
+
+		// Verify dirty flag is set
+		if !handle.dirty {
+			t.Error("dirty flag should be set after truncate")
+		}
+
+		// Verify reported size
+		if out.Size != 10 {
+			t.Errorf("reported size = %d, expected 10", out.Size)
+		}
+	})
+}
+
+// TestNewIssueFileNode_Setattr_NoHandle tests Setattr without a file handle.
+func TestNewIssueFileNode_Setattr_NoHandle(t *testing.T) {
+	db, _ := setupTestCache(t)
+	defer db.Close()
+
+	fileNode := &newIssueFileNode{
+		cache: db,
+		repo:  "test/repo",
+		title: "Test",
+	}
+
+	ctx := context.Background()
+
+	// Call Setattr with nil handle
+	in := &fuse.SetAttrIn{}
+	out := &fuse.AttrOut{}
+	errno := fileNode.Setattr(ctx, nil, in, out)
+	if errno != 0 {
+		t.Fatalf("Setattr with nil handle returned error: %v", errno)
+	}
+
+	// Should return default attributes
+	if out.Mode != 0644 {
+		t.Errorf("mode = %o, expected 0644", out.Mode)
+	}
+}
+
+// TestNewIssueFileNode_ConcurrentAccess tests concurrent read/write operations.
+func TestNewIssueFileNode_ConcurrentAccess(t *testing.T) {
+	db, _ := setupTestCache(t)
+	defer db.Close()
+
+	fileNode := &newIssueFileNode{
+		cache: db,
+		repo:  "test/repo",
+		title: "Concurrent Test",
+	}
+
+	ctx := context.Background()
+
+	// Open a single file handle
+	fh, _, errno := fileNode.Open(ctx, 0)
+	if errno != 0 {
+		t.Fatalf("Open returned error: %v", errno)
+	}
+
+	const numGoroutines = 10
+	const opsPerGoroutine = 50
+
+	var wg sync.WaitGroup
+	var readCount, writeCount int64
+
+	// Run concurrent reads and writes
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(2)
+
+		// Reader goroutine
+		go func() {
+			defer wg.Done()
+			for j := 0; j < opsPerGoroutine; j++ {
+				dest := make([]byte, 512)
+				_, err := fileNode.Read(ctx, fh, dest, 0)
+				if err != 0 {
+					t.Errorf("concurrent read error: %v", err)
+				}
+				atomic.AddInt64(&readCount, 1)
+			}
+		}()
+
+		// Writer goroutine
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < opsPerGoroutine; j++ {
+				data := []byte("data from goroutine")
+				_, err := fileNode.Write(ctx, fh, data, int64(id*50+j))
+				if err != 0 {
+					t.Errorf("concurrent write error: %v", err)
+				}
+				atomic.AddInt64(&writeCount, 1)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+
+	expectedOps := int64(numGoroutines * opsPerGoroutine)
+	if readCount != expectedOps {
+		t.Errorf("read count = %d, expected %d", readCount, expectedOps)
+	}
+	if writeCount != expectedOps {
+		t.Errorf("write count = %d, expected %d", writeCount, expectedOps)
+	}
+}
+
+// TestNewIssueFileHandle_BufferIsolation tests that each file handle has isolated buffer.
+func TestNewIssueFileHandle_BufferIsolation(t *testing.T) {
+	db, _ := setupTestCache(t)
+	defer db.Close()
+
+	fileNode := &newIssueFileNode{
+		cache: db,
+		repo:  "test/repo",
+		title: "Buffer Isolation Test",
+	}
+
+	ctx := context.Background()
+
+	// Open two handles
+	fh1, _, _ := fileNode.Open(ctx, 0)
+	fh2, _, _ := fileNode.Open(ctx, 0)
+
+	handle1 := fh1.(*newIssueFileHandle)
+	handle2 := fh2.(*newIssueFileHandle)
+
+	// Modify handle1's buffer
+	handle1.buffer = append(handle1.buffer, []byte(" - modified by handle1")...)
+
+	// handle2's buffer should be unchanged
+	if strings.Contains(string(handle2.buffer), "modified by handle1") {
+		t.Error("handle2's buffer should be independent of handle1's modifications")
+	}
+}
+
+// Note: TestRootNode_Create_NewIssue is omitted because Create() calls NewInode()
+// which requires a fully initialized FUSE bridge. This would require mounting an
+// actual FUSE filesystem which needs root privileges. The core functionality is
+// tested via the individual newIssueFileNode tests above.
+
+// TestRootNode_Create_InvalidFilename_Logic tests the filename validation logic
+// used by Create without requiring FUSE mounting.
+func TestRootNode_Create_InvalidFilename_Logic(t *testing.T) {
+	tests := []struct {
+		name     string
+		filename string
+		wantOK   bool
+	}{
+		{"valid new issue filename", "my-new-issue[new].md", true},
+		{"regular issue filename", "bug[123].md", false},
+		{"missing [new]", "bug.md", false},
+		{"uppercase NEW", "bug[NEW].md", false},
+		{"wrong extension", "bug[new].txt", false},
+		{"empty title", "[new].md", false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, ok := parseNewIssueFilename(tc.filename)
+			if ok != tc.wantOK {
+				t.Errorf("parseNewIssueFilename(%q) = %v, want %v", tc.filename, ok, tc.wantOK)
 			}
 		})
 	}

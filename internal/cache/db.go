@@ -213,7 +213,7 @@ func (db *DB) GetIssue(repo string, number int) (*Issue, error) {
 	`
 
 	row := db.conn.QueryRow(query, repo, number)
-	return scanIssue(row)
+	return scanIssueFrom(row)
 }
 
 // ListIssues retrieves all issues for a repository.
@@ -234,7 +234,7 @@ func (db *DB) ListIssues(repo string) ([]Issue, error) {
 
 	issues := []Issue{}
 	for rows.Next() {
-		issue, err := scanIssueFromRows(rows)
+		issue, err := scanIssueFrom(rows)
 		if err != nil {
 			return nil, err
 		}
@@ -312,7 +312,7 @@ func (db *DB) GetDirtyIssues(repo string) ([]Issue, error) {
 
 	issues := []Issue{}
 	for rows.Next() {
-		issue, err := scanIssueFromRows(rows)
+		issue, err := scanIssueFrom(rows)
 		if err != nil {
 			return nil, err
 		}
@@ -351,14 +351,19 @@ func (db *DB) ClearDirty(repo string, number int) error {
 	return nil
 }
 
-// scanIssue scans a single row into an Issue struct.
-// Used with QueryRow which returns *sql.Row.
-func scanIssue(row *sql.Row) (*Issue, error) {
+// scanner is an interface that both *sql.Row and *sql.Rows implement.
+type scanner interface {
+	Scan(dest ...interface{}) error
+}
+
+// scanIssueFrom scans a row into an Issue struct using the scanner interface.
+// This handles both *sql.Row and *sql.Rows.
+func scanIssueFrom(s scanner) (*Issue, error) {
 	var issue Issue
 	var body, state, author, labels, createdAt, updatedAt, etag, localUpdatedAt sql.NullString
 	var dirty int
 
-	err := row.Scan(
+	err := s.Scan(
 		&issue.ID,
 		&issue.Number,
 		&issue.Repo,
@@ -377,52 +382,6 @@ func scanIssue(row *sql.Row) (*Issue, error) {
 		if err == sql.ErrNoRows {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("failed to scan issue: %w", err)
-	}
-
-	// Handle nullable fields
-	issue.Body = body.String
-	issue.State = state.String
-	issue.Author = author.String
-	issue.CreatedAt = createdAt.String
-	issue.UpdatedAt = updatedAt.String
-	issue.ETag = etag.String
-	issue.LocalUpdatedAt = localUpdatedAt.String
-	issue.Dirty = dirty == 1
-
-	// Parse labels JSON
-	if labels.Valid && labels.String != "" {
-		if err := json.Unmarshal([]byte(labels.String), &issue.Labels); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal labels: %w", err)
-		}
-	}
-
-	return &issue, nil
-}
-
-// scanIssueFromRows scans a row from sql.Rows into an Issue struct.
-// Used with Query which returns *sql.Rows.
-func scanIssueFromRows(rows *sql.Rows) (*Issue, error) {
-	var issue Issue
-	var body, state, author, labels, createdAt, updatedAt, etag, localUpdatedAt sql.NullString
-	var dirty int
-
-	err := rows.Scan(
-		&issue.ID,
-		&issue.Number,
-		&issue.Repo,
-		&issue.Title,
-		&body,
-		&state,
-		&author,
-		&labels,
-		&createdAt,
-		&updatedAt,
-		&etag,
-		&dirty,
-		&localUpdatedAt,
-	)
-	if err != nil {
 		return nil, fmt.Errorf("failed to scan issue: %w", err)
 	}
 

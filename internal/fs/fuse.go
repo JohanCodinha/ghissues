@@ -240,6 +240,7 @@ func (r *rootNode) Rename(ctx context.Context, name string, newParent fs.InodeEm
 func (r *rootNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 	issues, err := r.cache.ListIssues(r.repo)
 	if err != nil {
+		logger.Warn("fuse: failed to list issues for repo %s: %v", r.repo, err)
 		return nil, syscall.EIO
 	}
 
@@ -266,14 +267,20 @@ func (r *rootNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) 
 
 	// Get the issue from the cache
 	issue, err := r.cache.GetIssue(r.repo, number)
-	if err != nil || issue == nil {
+	if err != nil {
+		logger.Warn("fuse: failed to get issue #%d from cache: %v", number, err)
+		return nil, syscall.EIO
+	}
+	if issue == nil {
 		return nil, syscall.ENOENT
 	}
 
 	// Get comments from the cache
 	comments, err := r.cache.GetComments(r.repo, number)
 	if err != nil {
-		comments = []cache.Comment{} // Use empty slice on error
+		// Log but continue with empty comments - issue content is more important
+		logger.Debug("fuse: failed to get comments for issue #%d: %v", number, err)
+		comments = []cache.Comment{}
 	}
 
 	// Generate markdown content to get file size
@@ -576,14 +583,21 @@ var _ = (fs.NodeSetattrer)((*issueFileNode)(nil))
 // Getattr returns file attributes.
 func (f *issueFileNode) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	issue, err := f.cache.GetIssue(f.repo, f.number)
-	if err != nil || issue == nil {
+	if err != nil {
+		logger.Warn("fuse: Getattr failed to get issue #%d: %v", f.number, err)
+		return syscall.EIO
+	}
+	if issue == nil {
+		logger.Warn("fuse: Getattr issue #%d not found in cache", f.number)
 		return syscall.EIO
 	}
 
 	// Get comments from the cache
 	comments, err := f.cache.GetComments(f.repo, f.number)
 	if err != nil {
-		comments = []cache.Comment{} // Use empty slice on error
+		// Log but continue with empty comments - issue content is more important
+		logger.Debug("fuse: Getattr failed to get comments for issue #%d: %v", f.number, err)
+		comments = []cache.Comment{}
 	}
 
 	content := md.ToMarkdown(issue, comments)
@@ -638,7 +652,12 @@ func (f *issueFileNode) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.
 
 	// No truncate requested - get current size from cache
 	issue, err := f.cache.GetIssue(f.repo, f.number)
-	if err != nil || issue == nil {
+	if err != nil {
+		logger.Warn("fuse: Setattr failed to get issue #%d: %v", f.number, err)
+		return syscall.EIO
+	}
+	if issue == nil {
+		logger.Warn("fuse: Setattr issue #%d not found in cache", f.number)
 		return syscall.EIO
 	}
 
@@ -653,7 +672,9 @@ func (f *issueFileNode) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.
 	// Get comments from the cache
 	comments, err := f.cache.GetComments(f.repo, f.number)
 	if err != nil {
-		comments = []cache.Comment{} // Use empty slice on error
+		// Log but continue with empty comments - issue content is more important
+		logger.Debug("fuse: Setattr failed to get comments for issue #%d: %v", f.number, err)
+		comments = []cache.Comment{}
 	}
 	content := md.ToMarkdown(issue, comments)
 	out.Size = uint64(len(content))
@@ -665,14 +686,21 @@ func (f *issueFileNode) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.
 func (f *issueFileNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
 	// Get the issue from cache
 	issue, err := f.cache.GetIssue(f.repo, f.number)
-	if err != nil || issue == nil {
+	if err != nil {
+		logger.Warn("fuse: Open failed to get issue #%d: %v", f.number, err)
+		return nil, 0, syscall.EIO
+	}
+	if issue == nil {
+		logger.Warn("fuse: Open issue #%d not found in cache", f.number)
 		return nil, 0, syscall.EIO
 	}
 
 	// Get comments from the cache
 	comments, err := f.cache.GetComments(f.repo, f.number)
 	if err != nil {
-		comments = []cache.Comment{} // Use empty slice on error
+		// Log but continue with empty comments - issue content is more important
+		logger.Debug("fuse: Open failed to get comments for issue #%d: %v", f.number, err)
+		comments = []cache.Comment{}
 	}
 
 	// Generate the content
@@ -696,13 +724,20 @@ func (f *issueFileNode) Read(ctx context.Context, fh fs.FileHandle, dest []byte,
 	if !ok {
 		// No handle, read directly from cache
 		issue, err := f.cache.GetIssue(f.repo, f.number)
-		if err != nil || issue == nil {
+		if err != nil {
+			logger.Warn("fuse: Read failed to get issue #%d: %v", f.number, err)
+			return nil, syscall.EIO
+		}
+		if issue == nil {
+			logger.Warn("fuse: Read issue #%d not found in cache", f.number)
 			return nil, syscall.EIO
 		}
 		// Get comments from the cache
 		comments, err := f.cache.GetComments(f.repo, f.number)
 		if err != nil {
-			comments = []cache.Comment{} // Use empty slice on error
+			// Log but continue with empty comments - issue content is more important
+			logger.Debug("fuse: Read failed to get comments for issue #%d: %v", f.number, err)
+			comments = []cache.Comment{}
 		}
 		content := md.ToMarkdown(issue, comments)
 		if off >= int64(len(content)) {
@@ -785,7 +820,12 @@ func (f *issueFileNode) Flush(ctx context.Context, fh fs.FileHandle) syscall.Err
 
 	// Get the original issue
 	original, err := f.cache.GetIssue(f.repo, f.number)
-	if err != nil || original == nil {
+	if err != nil {
+		logger.Warn("fuse: Flush failed to get original issue #%d: %v", f.number, err)
+		return syscall.EIO
+	}
+	if original == nil {
+		logger.Warn("fuse: Flush issue #%d not found in cache", f.number)
 		return syscall.EIO
 	}
 
@@ -806,6 +846,7 @@ func (f *issueFileNode) Flush(ctx context.Context, fh fs.FileHandle) syscall.Err
 		}
 		err = f.cache.MarkDirty(f.repo, f.number, titlePtr, bodyPtr)
 		if err != nil {
+			logger.Warn("fuse: Flush failed to mark issue #%d as dirty: %v", f.number, err)
 			return syscall.EIO
 		}
 		needsSync = true

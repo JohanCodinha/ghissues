@@ -56,6 +56,28 @@ func parseRepo(repo string) (string, string, error) {
 	return parts[0], parts[1], nil
 }
 
+// ghIssueToCacheIssue converts a GitHub issue to a cache issue.
+func (e *Engine) ghIssueToCacheIssue(ghIssue *gh.Issue) cache.Issue {
+	labels := make([]string, len(ghIssue.Labels))
+	for i, l := range ghIssue.Labels {
+		labels[i] = l.Name
+	}
+
+	return cache.Issue{
+		Number:    ghIssue.Number,
+		Repo:      e.repo,
+		Title:     ghIssue.Title,
+		Body:      ghIssue.Body,
+		State:     ghIssue.State,
+		Author:    ghIssue.User.Login,
+		Labels:    labels,
+		CreatedAt: ghIssue.CreatedAt.Format(time.RFC3339),
+		UpdatedAt: ghIssue.UpdatedAt.Format(time.RFC3339),
+		ETag:      ghIssue.ETag,
+		Dirty:     false,
+	}
+}
+
 // InitialSync fetches all issues from GitHub and populates the cache.
 // This should be called on mount.
 func (e *Engine) InitialSync() error {
@@ -69,26 +91,7 @@ func (e *Engine) InitialSync() error {
 	logger.Debug("sync: fetched %d issues from GitHub", len(issues))
 
 	for _, ghIssue := range issues {
-		// Convert labels to string slice
-		labels := make([]string, len(ghIssue.Labels))
-		for i, l := range ghIssue.Labels {
-			labels[i] = l.Name
-		}
-
-		cacheIssue := cache.Issue{
-			Number:    ghIssue.Number,
-			Repo:      e.repo,
-			Title:     ghIssue.Title,
-			Body:      ghIssue.Body,
-			State:     ghIssue.State,
-			Author:    ghIssue.User.Login,
-			Labels:    labels,
-			CreatedAt: ghIssue.CreatedAt.Format(time.RFC3339),
-			UpdatedAt: ghIssue.UpdatedAt.Format(time.RFC3339),
-			ETag:      ghIssue.ETag,
-			Dirty:     false,
-		}
-
+		cacheIssue := e.ghIssueToCacheIssue(&ghIssue)
 		if err := e.cache.UpsertIssue(cacheIssue); err != nil {
 			logger.Warn("sync: failed to upsert issue #%d: %v", ghIssue.Number, err)
 			// Continue with other issues
@@ -154,7 +157,7 @@ func (e *Engine) RefreshIssue(number int) (bool, error) {
 	}
 
 	// Fetch with etag for conditional request
-	ghIssue, newEtag, err := e.client.GetIssueWithEtag(e.owner, e.repoName, number, cachedIssue.ETag)
+	ghIssue, _, err := e.client.GetIssueWithEtag(e.owner, e.repoName, number, cachedIssue.ETag)
 	if err != nil {
 		return false, fmt.Errorf("failed to fetch issue: %w", err)
 	}
@@ -165,25 +168,8 @@ func (e *Engine) RefreshIssue(number int) (bool, error) {
 	}
 
 	// Issue was updated - update cache
-	labels := make([]string, len(ghIssue.Labels))
-	for i, l := range ghIssue.Labels {
-		labels[i] = l.Name
-	}
-
-	cacheIssue := cache.Issue{
-		Number:    ghIssue.Number,
-		Repo:      e.repo,
-		Title:     ghIssue.Title,
-		Body:      ghIssue.Body,
-		State:     ghIssue.State,
-		Author:    ghIssue.User.Login,
-		Labels:    labels,
-		CreatedAt: ghIssue.CreatedAt.Format(time.RFC3339),
-		UpdatedAt: ghIssue.UpdatedAt.Format(time.RFC3339),
-		ETag:      newEtag,
-		Dirty:     false,
-	}
-
+	// Note: ghIssue.ETag is set by GetIssueWithEtag, newEtag is the same value
+	cacheIssue := e.ghIssueToCacheIssue(ghIssue)
 	if err := e.cache.UpsertIssue(cacheIssue); err != nil {
 		return false, fmt.Errorf("failed to update cache: %w", err)
 	}
@@ -211,7 +197,11 @@ func (e *Engine) TriggerSync() {
 
 	// Start new timer
 	e.timer = time.AfterFunc(time.Duration(e.debounceMs)*time.Millisecond, func() {
-		// Sync pending new comments
+		// Sync pending new issues first (so they get issue numbers before comments are added)
+		if err := e.syncPendingIssues(); err != nil {
+			logger.Error("sync: error syncing pending issues: %v", err)
+		}
+		// Sync pending new comments (can now reference correct issue numbers)
 		if err := e.syncPendingComments(); err != nil {
 			logger.Error("sync: error syncing pending comments: %v", err)
 		}
@@ -222,10 +212,6 @@ func (e *Engine) TriggerSync() {
 		// Sync dirty issues
 		if err := e.syncDirtyIssues(); err != nil {
 			logger.Error("sync: error syncing dirty issues: %v", err)
-		}
-		// Sync pending new issues
-		if err := e.syncPendingIssues(); err != nil {
-			logger.Error("sync: error syncing pending issues: %v", err)
 		}
 	})
 
@@ -245,7 +231,12 @@ func (e *Engine) SyncNow() error {
 
 	var errs []error
 
-	// Sync pending new comments first (so they exist before any edits)
+	// Sync pending new issues first (so they get issue numbers before comments are added)
+	if err := e.syncPendingIssues(); err != nil {
+		errs = append(errs, fmt.Errorf("pending issues: %w", err))
+	}
+
+	// Sync pending new comments (can now reference correct issue numbers)
 	if err := e.syncPendingComments(); err != nil {
 		errs = append(errs, fmt.Errorf("pending comments: %w", err))
 	}
@@ -260,13 +251,13 @@ func (e *Engine) SyncNow() error {
 		errs = append(errs, fmt.Errorf("dirty issues: %w", err))
 	}
 
-	// Sync pending new issues
-	if err := e.syncPendingIssues(); err != nil {
-		errs = append(errs, fmt.Errorf("pending issues: %w", err))
-	}
-
 	if len(errs) > 0 {
-		return fmt.Errorf("sync errors: %v", errs)
+		// Join multiple errors into a single error with context
+		errMsgs := make([]string, len(errs))
+		for i, e := range errs {
+			errMsgs[i] = e.Error()
+		}
+		return fmt.Errorf("sync errors: %s", strings.Join(errMsgs, "; "))
 	}
 
 	return nil
@@ -294,7 +285,11 @@ func (e *Engine) syncDirtyIssues() error {
 	}
 
 	if len(syncErrors) > 0 {
-		return fmt.Errorf("sync errors: %v", syncErrors)
+		errMsgs := make([]string, len(syncErrors))
+		for i, e := range syncErrors {
+			errMsgs[i] = e.Error()
+		}
+		return fmt.Errorf("failed to sync %d dirty issues: %s", len(syncErrors), strings.Join(errMsgs, "; "))
 	}
 
 	return nil
@@ -450,7 +445,11 @@ func (e *Engine) syncPendingComments() error {
 	}
 
 	if len(syncErrors) > 0 {
-		return fmt.Errorf("sync errors: %v", syncErrors)
+		errMsgs := make([]string, len(syncErrors))
+		for i, e := range syncErrors {
+			errMsgs[i] = e.Error()
+		}
+		return fmt.Errorf("failed to sync %d pending comments: %s", len(syncErrors), strings.Join(errMsgs, "; "))
 	}
 
 	return nil
@@ -488,7 +487,11 @@ func (e *Engine) syncDirtyComments() error {
 	}
 
 	if len(syncErrors) > 0 {
-		return fmt.Errorf("sync errors: %v", syncErrors)
+		errMsgs := make([]string, len(syncErrors))
+		for i, e := range syncErrors {
+			errMsgs[i] = e.Error()
+		}
+		return fmt.Errorf("failed to sync %d dirty comments: %s", len(syncErrors), strings.Join(errMsgs, "; "))
 	}
 
 	return nil
@@ -523,25 +526,7 @@ func (e *Engine) syncPendingIssues() error {
 		}
 
 		// Add the newly created issue to the cache
-		labels := make([]string, len(ghIssue.Labels))
-		for i, l := range ghIssue.Labels {
-			labels[i] = l.Name
-		}
-
-		cacheIssue := cache.Issue{
-			Number:    ghIssue.Number,
-			Repo:      e.repo,
-			Title:     ghIssue.Title,
-			Body:      ghIssue.Body,
-			State:     ghIssue.State,
-			Author:    ghIssue.User.Login,
-			Labels:    labels,
-			CreatedAt: ghIssue.CreatedAt.Format(time.RFC3339),
-			UpdatedAt: ghIssue.UpdatedAt.Format(time.RFC3339),
-			ETag:      ghIssue.ETag,
-			Dirty:     false,
-		}
-
+		cacheIssue := e.ghIssueToCacheIssue(ghIssue)
 		if err := e.cache.UpsertIssue(cacheIssue); err != nil {
 			logger.Warn("sync: failed to cache newly created issue #%d: %v", ghIssue.Number, err)
 		}
@@ -550,7 +535,11 @@ func (e *Engine) syncPendingIssues() error {
 	}
 
 	if len(syncErrors) > 0 {
-		return fmt.Errorf("sync errors: %v", syncErrors)
+		errMsgs := make([]string, len(syncErrors))
+		for i, e := range syncErrors {
+			errMsgs[i] = e.Error()
+		}
+		return fmt.Errorf("failed to sync %d pending issues: %s", len(syncErrors), strings.Join(errMsgs, "; "))
 	}
 
 	return nil
