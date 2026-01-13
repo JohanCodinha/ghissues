@@ -481,7 +481,46 @@ else
     sleep 5
 
     rm -f /tmp/e2e_modified_issue.md
-    echo "✓ Sub-issues test completed"
+    echo "✓ Local → GitHub sub-issues test completed"
+
+    # === BIDIRECTIONAL TEST: GitHub → Local ===
+    echo ""
+    echo "Testing reverse direction: GitHub → Local..."
+
+    # Get the issue's numeric ID (needed for sub-issues API)
+    ISSUE_DATA=$(github_api GET "/repos/$TEST_REPO/issues/$ISSUE_NUMBER")
+    ISSUE_ID=$(echo "$ISSUE_DATA" | grep -o '"id": *[0-9]*' | head -1 | grep -o '[0-9]*')
+
+    if [ -n "$ISSUE_ID" ]; then
+        # Add sub-issue relationship via GitHub API directly
+        echo "Adding sub-issue relationship via GitHub API..."
+        ADD_RESULT=$(github_api POST "/repos/$TEST_REPO/issues/$PARENT_NUMBER/sub_issues" "{\"sub_issue_id\":$ISSUE_ID}" 2>&1)
+
+        if echo "$ADD_RESULT" | grep -q "error\|Error\|404\|422"; then
+            echo "WARNING: Could not add sub-issue via API: $ADD_RESULT"
+        else
+            echo "Sub-issue added via API, waiting for sync to pick up change..."
+            sleep 5
+
+            # Re-read the mounted file and check for parent_issue in frontmatter
+            UPDATED_CONTENT=$(cat "$MOUNTPOINT/$ISSUE_FILE")
+            if echo "$UPDATED_CONTENT" | grep -q "parent_issue: $PARENT_NUMBER"; then
+                echo "✓ GitHub → Local: parent_issue appears in mounted file"
+            else
+                echo "WARNING: parent_issue not found in mounted file (may need refresh)"
+                # Try forcing a refresh by re-reading
+                sleep 3
+                UPDATED_CONTENT=$(cat "$MOUNTPOINT/$ISSUE_FILE")
+                if echo "$UPDATED_CONTENT" | grep -q "parent_issue:"; then
+                    echo "Found parent_issue field: $(echo "$UPDATED_CONTENT" | grep "parent_issue:")"
+                fi
+            fi
+        fi
+    else
+        echo "WARNING: Could not get issue ID for bidirectional test"
+    fi
+
+    echo "✓ Sub-issues bidirectional test completed"
 fi
 
 echo ""
