@@ -211,8 +211,21 @@ func (e *Engine) TriggerSync() {
 
 	// Start new timer
 	e.timer = time.AfterFunc(time.Duration(e.debounceMs)*time.Millisecond, func() {
+		// Sync pending new comments
+		if err := e.syncPendingComments(); err != nil {
+			logger.Error("sync: error syncing pending comments: %v", err)
+		}
+		// Sync dirty (edited) comments
+		if err := e.syncDirtyComments(); err != nil {
+			logger.Error("sync: error syncing dirty comments: %v", err)
+		}
+		// Sync dirty issues
 		if err := e.syncDirtyIssues(); err != nil {
 			logger.Error("sync: error syncing dirty issues: %v", err)
+		}
+		// Sync pending new issues
+		if err := e.syncPendingIssues(); err != nil {
+			logger.Error("sync: error syncing pending issues: %v", err)
 		}
 	})
 
