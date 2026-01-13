@@ -33,6 +33,17 @@ type Issue struct {
 	LocalUpdatedAt string
 }
 
+// Comment represents a cached issue comment.
+type Comment struct {
+	ID          int64
+	IssueNumber int
+	Repo        string
+	Author      string
+	Body        string
+	CreatedAt   string
+	UpdatedAt   string
+}
+
 // createTableSQL defines the schema for the issues table.
 const createTableSQL = `
 CREATE TABLE IF NOT EXISTS issues (
@@ -53,6 +64,20 @@ CREATE TABLE IF NOT EXISTS issues (
 );
 `
 
+// createCommentsTableSQL defines the schema for the comments table.
+const createCommentsTableSQL = `
+CREATE TABLE IF NOT EXISTS comments (
+    id INTEGER PRIMARY KEY,
+    issue_number INTEGER NOT NULL,
+    repo TEXT NOT NULL,
+    author TEXT NOT NULL,
+    body TEXT,
+    created_at TEXT,
+    updated_at TEXT,
+    UNIQUE(repo, issue_number, id)
+);
+`
+
 // InitDB creates or opens a SQLite database at the given path and initializes the schema.
 func InitDB(path string) (*DB, error) {
 	conn, err := sql.Open("sqlite", path)
@@ -64,7 +89,14 @@ func InitDB(path string) (*DB, error) {
 	_, err = conn.Exec(createTableSQL)
 	if err != nil {
 		conn.Close()
-		return nil, fmt.Errorf("failed to create table: %w", err)
+		return nil, fmt.Errorf("failed to create issues table: %w", err)
+	}
+
+	// Create the comments table if it doesn't exist
+	_, err = conn.Exec(createCommentsTableSQL)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("failed to create comments table: %w", err)
 	}
 
 	return &DB{
@@ -347,4 +379,96 @@ func scanIssueFromRows(rows *sql.Rows) (*Issue, error) {
 	}
 
 	return &issue, nil
+}
+
+// UpsertComments inserts or updates comments for an issue in the cache.
+// This replaces all existing comments for the issue with the provided comments.
+func (db *DB) UpsertComments(repo string, issueNumber int, comments []Comment) error {
+	// Start a transaction to ensure atomicity
+	tx, err := db.conn.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Delete existing comments for this issue
+	_, err = tx.Exec("DELETE FROM comments WHERE repo = ? AND issue_number = ?", repo, issueNumber)
+	if err != nil {
+		return fmt.Errorf("failed to delete existing comments: %w", err)
+	}
+
+	// Insert new comments
+	query := `
+		INSERT INTO comments (id, issue_number, repo, author, body, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`
+
+	for _, comment := range comments {
+		_, err = tx.Exec(query,
+			comment.ID,
+			issueNumber,
+			repo,
+			comment.Author,
+			sql.NullString{String: comment.Body, Valid: comment.Body != ""},
+			sql.NullString{String: comment.CreatedAt, Valid: comment.CreatedAt != ""},
+			sql.NullString{String: comment.UpdatedAt, Valid: comment.UpdatedAt != ""},
+		)
+		if err != nil {
+			return fmt.Errorf("failed to insert comment %d: %w", comment.ID, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	return nil
+}
+
+// GetComments retrieves all comments for an issue from the cache.
+// Comments are ordered by created_at ascending.
+func (db *DB) GetComments(repo string, issueNumber int) ([]Comment, error) {
+	query := `
+		SELECT id, issue_number, repo, author, body, created_at, updated_at
+		FROM comments
+		WHERE repo = ? AND issue_number = ?
+		ORDER BY created_at ASC
+	`
+
+	rows, err := db.conn.Query(query, repo, issueNumber)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query comments: %w", err)
+	}
+	defer rows.Close()
+
+	comments := []Comment{}
+	for rows.Next() {
+		var comment Comment
+		var body, createdAt, updatedAt sql.NullString
+
+		err := rows.Scan(
+			&comment.ID,
+			&comment.IssueNumber,
+			&comment.Repo,
+			&comment.Author,
+			&body,
+			&createdAt,
+			&updatedAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan comment: %w", err)
+		}
+
+		comment.Body = body.String
+		comment.CreatedAt = createdAt.String
+		comment.UpdatedAt = updatedAt.String
+
+		comments = append(comments, comment)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating comment rows: %w", err)
+	}
+
+	return comments, nil
 }

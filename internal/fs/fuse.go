@@ -213,8 +213,14 @@ func (r *rootNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) 
 		return nil, syscall.ENOENT
 	}
 
+	// Get comments from the cache
+	comments, err := r.cache.GetComments(r.repo, number)
+	if err != nil {
+		comments = []cache.Comment{} // Use empty slice on error
+	}
+
 	// Generate markdown content to get file size
-	content := md.ToMarkdown(issue)
+	content := md.ToMarkdown(issue, comments)
 
 	// Set up attributes
 	out.Mode = 0644
@@ -266,7 +272,13 @@ func (f *issueFileNode) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse
 		return syscall.EIO
 	}
 
-	content := md.ToMarkdown(issue)
+	// Get comments from the cache
+	comments, err := f.cache.GetComments(f.repo, f.number)
+	if err != nil {
+		comments = []cache.Comment{} // Use empty slice on error
+	}
+
+	content := md.ToMarkdown(issue, comments)
 
 	out.Mode = 0644
 	out.Size = uint64(len(content))
@@ -312,7 +324,12 @@ func (f *issueFileNode) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.
 	if sz, ok := in.GetSize(); ok {
 		out.Size = sz
 	} else {
-		content := md.ToMarkdown(issue)
+		// Get comments from the cache
+		comments, err := f.cache.GetComments(f.repo, f.number)
+		if err != nil {
+			comments = []cache.Comment{} // Use empty slice on error
+		}
+		content := md.ToMarkdown(issue, comments)
 		out.Size = uint64(len(content))
 	}
 
@@ -327,8 +344,14 @@ func (f *issueFileNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, 
 		return nil, 0, syscall.EIO
 	}
 
+	// Get comments from the cache
+	comments, err := f.cache.GetComments(f.repo, f.number)
+	if err != nil {
+		comments = []cache.Comment{} // Use empty slice on error
+	}
+
 	// Generate the content
-	content := md.ToMarkdown(issue)
+	content := md.ToMarkdown(issue, comments)
 
 	handle := &issueFileHandle{
 		cache:   f.cache,
@@ -351,7 +374,12 @@ func (f *issueFileNode) Read(ctx context.Context, fh fs.FileHandle, dest []byte,
 		if err != nil || issue == nil {
 			return nil, syscall.EIO
 		}
-		content := md.ToMarkdown(issue)
+		// Get comments from the cache
+		comments, err := f.cache.GetComments(f.repo, f.number)
+		if err != nil {
+			comments = []cache.Comment{} // Use empty slice on error
+		}
+		content := md.ToMarkdown(issue, comments)
 		if off >= int64(len(content)) {
 			return fuse.ReadResultData(nil), 0
 		}

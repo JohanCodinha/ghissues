@@ -564,3 +564,183 @@ Line 3`
 		t.Error("should preserve blank lines between paragraphs")
 	}
 }
+
+// Comment rendering tests
+
+func TestToMarkdown_WithComments(t *testing.T) {
+	issue := &cache.Issue{
+		Number:    1,
+		Repo:      "owner/repo",
+		Title:     "Test Issue",
+		Body:      "Issue body",
+		State:     "open",
+		Author:    "alice",
+		CreatedAt: "2026-01-08T09:15:00Z",
+		UpdatedAt: "2026-01-10T16:03:00Z",
+	}
+
+	comments := []cache.Comment{
+		{
+			ID:        987654,
+			Author:    "alice",
+			Body:      "I can reproduce this on version 2.3.1",
+			CreatedAt: "2026-01-10T14:12:00Z",
+			UpdatedAt: "2026-01-10T14:12:00Z",
+		},
+		{
+			ID:        987655,
+			Author:    "bob",
+			Body:      "Looking into it now. Seems related to the pagination changes.",
+			CreatedAt: "2026-01-10T16:03:00Z",
+			UpdatedAt: "2026-01-10T16:03:00Z",
+		},
+	}
+
+	result := ToMarkdown(issue, comments)
+
+	// Check comments count in frontmatter
+	if !strings.Contains(result, "comments: 2") {
+		t.Error("expected comments: 2 in frontmatter")
+	}
+
+	// Check Comments section exists
+	if !strings.Contains(result, "## Comments") {
+		t.Error("expected ## Comments section")
+	}
+
+	// Check first comment header
+	if !strings.Contains(result, "### 2026-01-10T14:12:00Z - alice") {
+		t.Error("expected first comment header with timestamp and author")
+	}
+
+	// Check comment_id HTML comment
+	if !strings.Contains(result, "<!-- comment_id: 987654 -->") {
+		t.Error("expected comment_id HTML comment for first comment")
+	}
+
+	// Check first comment body
+	if !strings.Contains(result, "I can reproduce this on version 2.3.1") {
+		t.Error("expected first comment body")
+	}
+
+	// Check second comment header
+	if !strings.Contains(result, "### 2026-01-10T16:03:00Z - bob") {
+		t.Error("expected second comment header")
+	}
+
+	// Check second comment_id
+	if !strings.Contains(result, "<!-- comment_id: 987655 -->") {
+		t.Error("expected comment_id HTML comment for second comment")
+	}
+}
+
+func TestToMarkdown_NoComments(t *testing.T) {
+	issue := &cache.Issue{
+		Number: 1,
+		Repo:   "owner/repo",
+		Title:  "Test Issue",
+		Body:   "Issue body",
+		State:  "open",
+	}
+
+	result := ToMarkdown(issue)
+
+	// Check comments count is 0 in frontmatter
+	if !strings.Contains(result, "comments: 0") {
+		t.Error("expected comments: 0 in frontmatter when no comments")
+	}
+
+	// Should not have Comments section
+	if strings.Contains(result, "## Comments") {
+		t.Error("should not have ## Comments section when no comments")
+	}
+}
+
+func TestToMarkdown_EmptyCommentsSlice(t *testing.T) {
+	issue := &cache.Issue{
+		Number: 1,
+		Repo:   "owner/repo",
+		Title:  "Test Issue",
+		Body:   "Issue body",
+		State:  "open",
+	}
+
+	result := ToMarkdown(issue, []cache.Comment{})
+
+	// Check comments count is 0 in frontmatter
+	if !strings.Contains(result, "comments: 0") {
+		t.Error("expected comments: 0 in frontmatter with empty comments slice")
+	}
+
+	// Should not have Comments section
+	if strings.Contains(result, "## Comments") {
+		t.Error("should not have ## Comments section with empty comments slice")
+	}
+}
+
+func TestToMarkdown_CommentWithMultilineBody(t *testing.T) {
+	issue := &cache.Issue{
+		Number: 1,
+		Repo:   "owner/repo",
+		Title:  "Test Issue",
+		Body:   "Issue body",
+	}
+
+	comments := []cache.Comment{
+		{
+			ID:        100,
+			Author:    "alice",
+			Body:      "First line\n\nSecond paragraph\n\nThird paragraph",
+			CreatedAt: "2026-01-10T14:12:00Z",
+		},
+	}
+
+	result := ToMarkdown(issue, comments)
+
+	// Check multiline body is preserved
+	if !strings.Contains(result, "First line\n\nSecond paragraph\n\nThird paragraph") {
+		t.Error("multiline comment body should be preserved")
+	}
+}
+
+func TestRoundTrip_WithComments_BodyNotContaminated(t *testing.T) {
+	// This test ensures that when we parse markdown with comments,
+	// the body doesn't include the comments section
+	issue := &cache.Issue{
+		Number: 1,
+		Repo:   "owner/repo",
+		Title:  "Test Issue",
+		Body:   "Original body content",
+	}
+
+	comments := []cache.Comment{
+		{
+			ID:        100,
+			Author:    "alice",
+			Body:      "This is a comment",
+			CreatedAt: "2026-01-10T14:12:00Z",
+		},
+	}
+
+	// Convert to markdown with comments
+	markdown := ToMarkdown(issue, comments)
+
+	// Parse back
+	parsed, err := FromMarkdown(markdown)
+	if err != nil {
+		t.Fatalf("failed to parse markdown: %v", err)
+	}
+
+	// Body should NOT contain comment content
+	if strings.Contains(parsed.Body, "This is a comment") {
+		t.Error("parsed body should not contain comment content")
+	}
+	if strings.Contains(parsed.Body, "## Comments") {
+		t.Error("parsed body should not contain ## Comments section")
+	}
+
+	// Body should still have original content
+	if !strings.Contains(parsed.Body, "Original body content") {
+		t.Error("parsed body should contain original body content")
+	}
+}

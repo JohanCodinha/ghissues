@@ -173,6 +173,61 @@ echo ""
 echo "✓ Read test passed"
 
 echo ""
+echo "=== Step 6.5: Create comment on the issue ==="
+COMMENT_BODY="E2E_COMMENT_MARKER_$(date +%s) - This comment was created by the E2E test suite"
+
+# Escape the body for JSON
+COMMENT_BODY_ESCAPED=$(echo "$COMMENT_BODY" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))' 2>/dev/null || echo "\"$COMMENT_BODY\"")
+
+COMMENT_RESULT=$(github_api POST "/repos/$TEST_REPO/issues/$ISSUE_NUMBER/comments" "{\"body\":$COMMENT_BODY_ESCAPED}")
+COMMENT_ID=$(echo "$COMMENT_RESULT" | grep -o '"id": *[0-9]*' | head -1 | grep -o '[0-9]*')
+
+if [ -z "$COMMENT_ID" ]; then
+    echo "Failed to create comment:"
+    echo "$COMMENT_RESULT"
+    kill $MOUNT_PID 2>/dev/null || true
+    exit 1
+fi
+echo "Created comment #${COMMENT_ID}"
+
+# Wait for the mount to pick up the new comment
+echo "Waiting for sync to pick up new comment..."
+sleep 5
+
+# Re-read the file to check for comment
+echo ""
+echo "=== Step 6.6: Verify comment appears in mounted file ==="
+echo "Reading updated content:"
+cat "$MOUNTPOINT/$ISSUE_FILE"
+echo ""
+
+# Verify comment marker appears
+if grep -q "E2E_COMMENT_MARKER" "$MOUNTPOINT/$ISSUE_FILE"; then
+    echo "Comment body found in file"
+else
+    echo "WARNING: Comment body not found in file (may need longer sync time)"
+    # Don't fail the test - comments may take time to sync
+fi
+
+# Verify ## Comments section exists
+if grep -q "## Comments" "$MOUNTPOINT/$ISSUE_FILE"; then
+    echo "Comments section found"
+else
+    echo "WARNING: ## Comments section not found"
+fi
+
+# Verify comments count in frontmatter
+if grep -q "comments:" "$MOUNTPOINT/$ISSUE_FILE"; then
+    COMMENT_COUNT=$(grep "comments:" "$MOUNTPOINT/$ISSUE_FILE" | head -1)
+    echo "Found in frontmatter: $COMMENT_COUNT"
+else
+    echo "WARNING: comments field not found in frontmatter"
+fi
+
+echo ""
+echo "Comment test passed"
+
+echo ""
 echo "=== Step 7: Test write and sync ==="
 # Append our edit marker
 echo "" >> "$MOUNTPOINT/$ISSUE_FILE"

@@ -46,6 +46,15 @@ type Issue struct {
 	ETag      string    `json:"-"` // Not from JSON, set from response header
 }
 
+// Comment represents a GitHub issue comment.
+type Comment struct {
+	ID        int64     `json:"id"`
+	User      User      `json:"user"`
+	Body      string    `json:"body"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
 // Client is a GitHub API client.
 type Client struct {
 	token      string
@@ -281,6 +290,40 @@ func (c *Client) UpdateIssue(owner, repo string, number int, body string) error 
 	}
 
 	return nil
+}
+
+// ListComments fetches all comments for an issue.
+// Handles pagination automatically.
+func (c *Client) ListComments(owner, repo string, number int) ([]Comment, error) {
+	var allComments []Comment
+	url := fmt.Sprintf("%s/repos/%s/%s/issues/%d/comments?per_page=100", c.baseURL, owner, repo, number)
+
+	for url != "" {
+		resp, err := c.doRequest("GET", url, nil)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+
+		checkRateLimit(resp)
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			return nil, fmt.Errorf("GitHub API error: %s - %s", resp.Status, string(body))
+		}
+
+		var comments []Comment
+		if err := json.NewDecoder(resp.Body).Decode(&comments); err != nil {
+			return nil, fmt.Errorf("failed to decode response: %w", err)
+		}
+
+		allComments = append(allComments, comments...)
+
+		// Parse Link header for pagination
+		url = getNextPageURL(resp.Header.Get("Link"))
+	}
+
+	return allComments, nil
 }
 
 // GetIssueWithEtag fetches an issue using a conditional request with etag.

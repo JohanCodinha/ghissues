@@ -93,9 +93,44 @@ func (e *Engine) InitialSync() error {
 			log.Printf("sync: failed to upsert issue #%d: %v", ghIssue.Number, err)
 			// Continue with other issues
 		}
+
+		// Fetch comments for this issue
+		if err := e.syncComments(ghIssue.Number); err != nil {
+			log.Printf("sync: failed to sync comments for issue #%d: %v", ghIssue.Number, err)
+			// Continue with other issues
+		}
 	}
 
 	log.Printf("sync: initial sync complete")
+	return nil
+}
+
+// syncComments fetches and caches comments for an issue.
+func (e *Engine) syncComments(number int) error {
+	ghComments, err := e.client.ListComments(e.owner, e.repoName, number)
+	if err != nil {
+		return fmt.Errorf("failed to list comments: %w", err)
+	}
+
+	// Convert gh.Comment to cache.Comment
+	cacheComments := make([]cache.Comment, len(ghComments))
+	for i, ghComment := range ghComments {
+		cacheComments[i] = cache.Comment{
+			ID:          ghComment.ID,
+			IssueNumber: number,
+			Repo:        e.repo,
+			Author:      ghComment.User.Login,
+			Body:        ghComment.Body,
+			CreatedAt:   ghComment.CreatedAt.Format(time.RFC3339),
+			UpdatedAt:   ghComment.UpdatedAt.Format(time.RFC3339),
+		}
+	}
+
+	if err := e.cache.UpsertComments(e.repo, number, cacheComments); err != nil {
+		return fmt.Errorf("failed to upsert comments: %w", err)
+	}
+
+	log.Printf("sync: synced %d comments for issue #%d", len(cacheComments), number)
 	return nil
 }
 
@@ -151,6 +186,12 @@ func (e *Engine) RefreshIssue(number int) (bool, error) {
 
 	if err := e.cache.UpsertIssue(cacheIssue); err != nil {
 		return false, fmt.Errorf("failed to update cache: %w", err)
+	}
+
+	// Also refresh comments for this issue
+	if err := e.syncComments(number); err != nil {
+		log.Printf("sync: warning: failed to refresh comments for issue #%d: %v", number, err)
+		// Don't fail the whole refresh - issue update succeeded
 	}
 
 	log.Printf("sync: refreshed issue #%d from GitHub", number)

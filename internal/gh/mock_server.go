@@ -13,14 +13,16 @@ import (
 // MockServer provides a fake GitHub API for testing
 type MockServer struct {
 	*httptest.Server
-	mu     sync.RWMutex
-	issues map[int]*Issue // issue number -> issue
+	mu       sync.RWMutex
+	issues   map[int]*Issue              // issue number -> issue
+	comments map[int][]*Comment          // issue number -> comments
 }
 
 // NewMockServer creates a mock GitHub API server
 func NewMockServer() *MockServer {
 	m := &MockServer{
-		issues: make(map[int]*Issue),
+		issues:   make(map[int]*Issue),
+		comments: make(map[int][]*Comment),
 	}
 
 	mux := http.NewServeMux()
@@ -57,6 +59,17 @@ func NewMockServer() *MockServer {
 					http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				}
 				return
+			} else if len(parts) == 5 && parts[4] == "comments" {
+				// List comments: /repos/{owner}/{repo}/issues/{number}/comments
+				number, err := strconv.Atoi(parts[3])
+				if err != nil {
+					http.Error(w, "invalid issue number", http.StatusBadRequest)
+					return
+				}
+				if r.Method == http.MethodGet {
+					m.handleListComments(w, r, number)
+					return
+				}
 			}
 		}
 		http.Error(w, "not found", http.StatusNotFound)
@@ -80,11 +93,26 @@ func (m *MockServer) GetIssue(number int) *Issue {
 	return m.issues[number]
 }
 
-// Reset clears all issues
+// Reset clears all issues and comments
 func (m *MockServer) Reset() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.issues = make(map[int]*Issue)
+	m.comments = make(map[int][]*Comment)
+}
+
+// AddComment adds a comment to an issue in the mock server
+func (m *MockServer) AddComment(issueNumber int, comment *Comment) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.comments[issueNumber] = append(m.comments[issueNumber], comment)
+}
+
+// GetComments retrieves comments for an issue (for test assertions)
+func (m *MockServer) GetComments(issueNumber int) []*Comment {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.comments[issueNumber]
 }
 
 func (m *MockServer) handleListIssues(w http.ResponseWriter, r *http.Request) {
@@ -151,4 +179,17 @@ func (m *MockServer) handleUpdateIssue(w http.ResponseWriter, r *http.Request, n
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(issue)
+}
+
+func (m *MockServer) handleListComments(w http.ResponseWriter, r *http.Request, number int) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	comments := m.comments[number]
+	if comments == nil {
+		comments = []*Comment{}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(comments)
 }

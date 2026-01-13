@@ -661,3 +661,262 @@ func TestSameNumberDifferentRepos(t *testing.T) {
 		t.Error("repo2 issue not found or wrong title")
 	}
 }
+
+// Comment tests
+
+func TestUpsertComments_InsertsNewComments(t *testing.T) {
+	db, cleanup := createTestDB(t)
+	defer cleanup()
+
+	// First insert an issue
+	issue := Issue{Number: 1, Repo: "owner/repo", Title: "Test Issue"}
+	if err := db.UpsertIssue(issue); err != nil {
+		t.Fatalf("failed to insert issue: %v", err)
+	}
+
+	// Insert comments
+	comments := []Comment{
+		{
+			ID:          100,
+			IssueNumber: 1,
+			Repo:        "owner/repo",
+			Author:      "alice",
+			Body:        "First comment",
+			CreatedAt:   "2026-01-10T14:12:00Z",
+			UpdatedAt:   "2026-01-10T14:12:00Z",
+		},
+		{
+			ID:          101,
+			IssueNumber: 1,
+			Repo:        "owner/repo",
+			Author:      "bob",
+			Body:        "Second comment",
+			CreatedAt:   "2026-01-10T16:03:00Z",
+			UpdatedAt:   "2026-01-10T16:03:00Z",
+		},
+	}
+
+	err := db.UpsertComments("owner/repo", 1, comments)
+	if err != nil {
+		t.Fatalf("UpsertComments failed: %v", err)
+	}
+
+	// Retrieve and verify
+	retrieved, err := db.GetComments("owner/repo", 1)
+	if err != nil {
+		t.Fatalf("GetComments failed: %v", err)
+	}
+
+	if len(retrieved) != 2 {
+		t.Fatalf("expected 2 comments, got %d", len(retrieved))
+	}
+
+	// Check first comment
+	if retrieved[0].ID != 100 {
+		t.Errorf("expected first comment ID 100, got %d", retrieved[0].ID)
+	}
+	if retrieved[0].Author != "alice" {
+		t.Errorf("expected author 'alice', got %s", retrieved[0].Author)
+	}
+	if retrieved[0].Body != "First comment" {
+		t.Errorf("expected body 'First comment', got %s", retrieved[0].Body)
+	}
+
+	// Check second comment
+	if retrieved[1].ID != 101 {
+		t.Errorf("expected second comment ID 101, got %d", retrieved[1].ID)
+	}
+	if retrieved[1].Author != "bob" {
+		t.Errorf("expected author 'bob', got %s", retrieved[1].Author)
+	}
+}
+
+func TestUpsertComments_ReplacesExistingComments(t *testing.T) {
+	db, cleanup := createTestDB(t)
+	defer cleanup()
+
+	// Insert an issue
+	issue := Issue{Number: 1, Repo: "owner/repo", Title: "Test Issue"}
+	if err := db.UpsertIssue(issue); err != nil {
+		t.Fatalf("failed to insert issue: %v", err)
+	}
+
+	// Insert initial comments
+	initialComments := []Comment{
+		{ID: 100, Author: "alice", Body: "Initial comment"},
+	}
+	if err := db.UpsertComments("owner/repo", 1, initialComments); err != nil {
+		t.Fatalf("failed to insert initial comments: %v", err)
+	}
+
+	// Replace with new comments
+	newComments := []Comment{
+		{ID: 200, Author: "charlie", Body: "New comment 1"},
+		{ID: 201, Author: "dave", Body: "New comment 2"},
+	}
+	if err := db.UpsertComments("owner/repo", 1, newComments); err != nil {
+		t.Fatalf("failed to replace comments: %v", err)
+	}
+
+	// Retrieve and verify old comments are gone
+	retrieved, err := db.GetComments("owner/repo", 1)
+	if err != nil {
+		t.Fatalf("GetComments failed: %v", err)
+	}
+
+	if len(retrieved) != 2 {
+		t.Fatalf("expected 2 comments after replace, got %d", len(retrieved))
+	}
+
+	// Should not contain the old comment
+	for _, c := range retrieved {
+		if c.ID == 100 {
+			t.Error("old comment should have been replaced")
+		}
+	}
+
+	// Should contain new comments
+	if retrieved[0].ID != 200 && retrieved[1].ID != 200 {
+		t.Error("new comment 200 not found")
+	}
+}
+
+func TestGetComments_ReturnsEmptySliceForNoComments(t *testing.T) {
+	db, cleanup := createTestDB(t)
+	defer cleanup()
+
+	// Insert an issue with no comments
+	issue := Issue{Number: 1, Repo: "owner/repo", Title: "Test Issue"}
+	if err := db.UpsertIssue(issue); err != nil {
+		t.Fatalf("failed to insert issue: %v", err)
+	}
+
+	// Get comments for an issue with no comments
+	comments, err := db.GetComments("owner/repo", 1)
+	if err != nil {
+		t.Fatalf("GetComments failed: %v", err)
+	}
+
+	if comments == nil {
+		t.Error("expected empty slice, got nil")
+	}
+	if len(comments) != 0 {
+		t.Errorf("expected 0 comments, got %d", len(comments))
+	}
+}
+
+func TestGetComments_ReturnsCommentsOrderedByCreatedAt(t *testing.T) {
+	db, cleanup := createTestDB(t)
+	defer cleanup()
+
+	// Insert an issue
+	issue := Issue{Number: 1, Repo: "owner/repo", Title: "Test Issue"}
+	if err := db.UpsertIssue(issue); err != nil {
+		t.Fatalf("failed to insert issue: %v", err)
+	}
+
+	// Insert comments out of order
+	comments := []Comment{
+		{ID: 102, Author: "charlie", Body: "Third", CreatedAt: "2026-01-12T10:00:00Z"},
+		{ID: 100, Author: "alice", Body: "First", CreatedAt: "2026-01-10T10:00:00Z"},
+		{ID: 101, Author: "bob", Body: "Second", CreatedAt: "2026-01-11T10:00:00Z"},
+	}
+	if err := db.UpsertComments("owner/repo", 1, comments); err != nil {
+		t.Fatalf("failed to insert comments: %v", err)
+	}
+
+	// Retrieve and verify order
+	retrieved, err := db.GetComments("owner/repo", 1)
+	if err != nil {
+		t.Fatalf("GetComments failed: %v", err)
+	}
+
+	if len(retrieved) != 3 {
+		t.Fatalf("expected 3 comments, got %d", len(retrieved))
+	}
+
+	// Should be ordered by created_at ascending
+	if retrieved[0].ID != 100 {
+		t.Errorf("expected first comment ID 100, got %d", retrieved[0].ID)
+	}
+	if retrieved[1].ID != 101 {
+		t.Errorf("expected second comment ID 101, got %d", retrieved[1].ID)
+	}
+	if retrieved[2].ID != 102 {
+		t.Errorf("expected third comment ID 102, got %d", retrieved[2].ID)
+	}
+}
+
+func TestUpsertComments_EmptyCommentsList(t *testing.T) {
+	db, cleanup := createTestDB(t)
+	defer cleanup()
+
+	// Insert an issue
+	issue := Issue{Number: 1, Repo: "owner/repo", Title: "Test Issue"}
+	if err := db.UpsertIssue(issue); err != nil {
+		t.Fatalf("failed to insert issue: %v", err)
+	}
+
+	// First insert some comments
+	comments := []Comment{
+		{ID: 100, Author: "alice", Body: "Comment"},
+	}
+	if err := db.UpsertComments("owner/repo", 1, comments); err != nil {
+		t.Fatalf("failed to insert comments: %v", err)
+	}
+
+	// Now upsert with empty list (should clear all comments)
+	if err := db.UpsertComments("owner/repo", 1, []Comment{}); err != nil {
+		t.Fatalf("failed to upsert empty comments: %v", err)
+	}
+
+	// Verify comments are cleared
+	retrieved, err := db.GetComments("owner/repo", 1)
+	if err != nil {
+		t.Fatalf("GetComments failed: %v", err)
+	}
+
+	if len(retrieved) != 0 {
+		t.Errorf("expected 0 comments after clearing, got %d", len(retrieved))
+	}
+}
+
+func TestGetComments_IsolatedByRepoAndIssue(t *testing.T) {
+	db, cleanup := createTestDB(t)
+	defer cleanup()
+
+	// Insert issues in different repos
+	issue1 := Issue{Number: 1, Repo: "owner/repo1", Title: "Issue 1"}
+	issue2 := Issue{Number: 1, Repo: "owner/repo2", Title: "Issue 2"}
+	issue3 := Issue{Number: 2, Repo: "owner/repo1", Title: "Issue 3"}
+
+	for _, issue := range []Issue{issue1, issue2, issue3} {
+		if err := db.UpsertIssue(issue); err != nil {
+			t.Fatalf("failed to insert issue: %v", err)
+		}
+	}
+
+	// Insert comments for different repo/issue combinations
+	if err := db.UpsertComments("owner/repo1", 1, []Comment{{ID: 100, Author: "a", Body: "repo1-issue1"}}); err != nil {
+		t.Fatalf("failed to insert comments: %v", err)
+	}
+	if err := db.UpsertComments("owner/repo2", 1, []Comment{{ID: 200, Author: "b", Body: "repo2-issue1"}}); err != nil {
+		t.Fatalf("failed to insert comments: %v", err)
+	}
+	if err := db.UpsertComments("owner/repo1", 2, []Comment{{ID: 300, Author: "c", Body: "repo1-issue2"}}); err != nil {
+		t.Fatalf("failed to insert comments: %v", err)
+	}
+
+	// Get comments for repo1 issue 1
+	comments, err := db.GetComments("owner/repo1", 1)
+	if err != nil {
+		t.Fatalf("GetComments failed: %v", err)
+	}
+
+	if len(comments) != 1 {
+		t.Fatalf("expected 1 comment, got %d", len(comments))
+	}
+	if comments[0].ID != 100 {
+		t.Errorf("expected comment ID 100, got %d", comments[0].ID)
+	}
+}

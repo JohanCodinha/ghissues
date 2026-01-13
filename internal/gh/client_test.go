@@ -98,6 +98,25 @@ func TestUpdateIssueCompiles(t *testing.T) {
 	t.Log("UpdateIssue() compiles correctly")
 }
 
+func TestListComments(t *testing.T) {
+	token, err := GetToken()
+	if err != nil {
+		t.Skipf("Skipping: no GitHub token available (%v)", err)
+	}
+
+	client := New(token)
+	comments, err := client.ListComments("JohanCodinha", "ghissues", 1)
+	if err != nil {
+		t.Fatalf("ListComments() failed: %v", err)
+	}
+
+	t.Logf("Found %d comments for issue #1:", len(comments))
+	for _, comment := range comments {
+		t.Logf("  Comment #%d by %s at %s", comment.ID, comment.User.Login, comment.CreatedAt.Format("2006-01-02 15:04:05"))
+		t.Logf("    Body preview: %s...", truncate(comment.Body, 50))
+	}
+}
+
 func truncate(s string, max int) string {
 	if len(s) <= max {
 		return s

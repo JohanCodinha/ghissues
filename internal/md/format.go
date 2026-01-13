@@ -41,11 +41,19 @@ type frontmatter struct {
 	CreatedAt string   `yaml:"created_at"`
 	UpdatedAt string   `yaml:"updated_at"`
 	ETag      string   `yaml:"etag"`
+	Comments  int      `yaml:"comments"`
 }
 
 // ToMarkdown converts a cache.Issue to markdown format with YAML frontmatter.
-func ToMarkdown(issue *cache.Issue) string {
+// If comments are provided, they are included in a ## Comments section.
+func ToMarkdown(issue *cache.Issue, comments ...[]cache.Comment) string {
 	var sb strings.Builder
+
+	// Get comments if provided
+	var issueComments []cache.Comment
+	if len(comments) > 0 {
+		issueComments = comments[0]
+	}
 
 	// Build frontmatter
 	fm := frontmatter{
@@ -58,6 +66,7 @@ func ToMarkdown(issue *cache.Issue) string {
 		CreatedAt: issue.CreatedAt,
 		UpdatedAt: issue.UpdatedAt,
 		ETag:      issue.ETag,
+		Comments:  len(issueComments),
 	}
 
 	// Marshal frontmatter to YAML
@@ -83,11 +92,35 @@ func ToMarkdown(issue *cache.Issue) string {
 	sb.WriteString("\n## Body\n\n")
 	sb.WriteString(issue.Body)
 
-	// Ensure file ends with newline if body doesn't have one
+	// Ensure body section ends with newline
 	if len(issue.Body) > 0 && !strings.HasSuffix(issue.Body, "\n") {
 		sb.WriteString("\n")
-	} else if len(issue.Body) == 0 {
-		// Empty body - no trailing newline needed beyond the section header
+	}
+
+	// Add comments section if there are comments
+	if len(issueComments) > 0 {
+		sb.WriteString("\n## Comments\n")
+
+		for _, comment := range issueComments {
+			// Format: ### 2026-01-10T14:12:00Z - username
+			sb.WriteString("\n### ")
+			sb.WriteString(comment.CreatedAt)
+			sb.WriteString(" - ")
+			sb.WriteString(comment.Author)
+			sb.WriteString("\n")
+
+			// Add comment_id HTML comment
+			sb.WriteString(fmt.Sprintf("<!-- comment_id: %d -->\n", comment.ID))
+
+			// Add comment body
+			sb.WriteString("\n")
+			sb.WriteString(comment.Body)
+
+			// Ensure comment body ends with newline
+			if len(comment.Body) > 0 && !strings.HasSuffix(comment.Body, "\n") {
+				sb.WriteString("\n")
+			}
+		}
 	}
 
 	return sb.String()

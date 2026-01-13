@@ -161,6 +161,151 @@ func TestE2E_MountReadWrite(t *testing.T) {
 	}
 }
 
+// TestE2E_IssueWithComments tests that comments are correctly rendered
+func TestE2E_IssueWithComments(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("FUSE tests require root or CAP_SYS_ADMIN")
+	}
+
+	// Start mock GitHub server
+	mockGH := gh.NewMockServer()
+	defer mockGH.Close()
+
+	// Seed test data with an issue
+	mockGH.AddIssue(&gh.Issue{
+		Number:    5,
+		Title:     "Issue with Comments",
+		Body:      "This issue has comments",
+		State:     "open",
+		User:      gh.User{Login: "issueauthor"},
+		CreatedAt: time.Now().Add(-48 * time.Hour),
+		UpdatedAt: time.Now().Add(-1 * time.Hour),
+		ETag:      `"comments-test-etag"`,
+	})
+
+	// Add comments to the issue
+	mockGH.AddComment(5, &gh.Comment{
+		ID:        101,
+		User:      gh.User{Login: "commenter1"},
+		Body:      "This is the first comment",
+		CreatedAt: time.Now().Add(-24 * time.Hour),
+		UpdatedAt: time.Now().Add(-24 * time.Hour),
+	})
+	mockGH.AddComment(5, &gh.Comment{
+		ID:        102,
+		User:      gh.User{Login: "commenter2"},
+		Body:      "This is the second comment with more detail",
+		CreatedAt: time.Now().Add(-12 * time.Hour),
+		UpdatedAt: time.Now().Add(-12 * time.Hour),
+	})
+
+	// Create temp directories
+	tmpDir := t.TempDir()
+	mountpoint := filepath.Join(tmpDir, "mount")
+	cachePath := filepath.Join(tmpDir, "cache.db")
+
+	if err := os.MkdirAll(mountpoint, 0755); err != nil {
+		t.Fatalf("failed to create mountpoint: %v", err)
+	}
+
+	// Initialize components
+	cacheDB, err := cache.InitDB(cachePath)
+	if err != nil {
+		t.Fatalf("failed to init cache: %v", err)
+	}
+	defer cacheDB.Close()
+
+	client := gh.NewWithBaseURL("test-token", mockGH.URL)
+	repo := "testowner/testrepo"
+
+	engine, err := sync.NewEngine(cacheDB, client, repo, 100) // 100ms debounce for tests
+	if err != nil {
+		t.Fatalf("failed to create sync engine: %v", err)
+	}
+	defer engine.Stop()
+
+	// Initial sync
+	if err := engine.InitialSync(); err != nil {
+		t.Fatalf("initial sync failed: %v", err)
+	}
+
+	// Create and mount filesystem
+	filesystem := fs.NewFS(cacheDB, repo, mountpoint, func() {
+		engine.TriggerSync()
+	})
+
+	// Mount in goroutine (blocks until unmount)
+	mountErr := make(chan error, 1)
+	go func() {
+		mountErr <- filesystem.Mount()
+	}()
+
+	// Wait for mount
+	time.Sleep(500 * time.Millisecond)
+
+	// Test: Read file with comments
+	t.Run("ReadFileWithComments", func(t *testing.T) {
+		files, _ := os.ReadDir(mountpoint)
+		var issueFile string
+		for _, f := range files {
+			if strings.Contains(f.Name(), "[5].md") {
+				issueFile = f.Name()
+				break
+			}
+		}
+		if issueFile == "" {
+			t.Fatalf("could not find issue file for #5")
+		}
+
+		content, err := os.ReadFile(filepath.Join(mountpoint, issueFile))
+		if err != nil {
+			t.Fatalf("failed to read file: %v", err)
+		}
+
+		contentStr := string(content)
+
+		// Verify frontmatter contains comments count
+		if !strings.Contains(contentStr, "comments: 2") {
+			t.Errorf("expected 'comments: 2' in frontmatter, got: %s", contentStr)
+		}
+
+		// Verify ## Comments section exists
+		if !strings.Contains(contentStr, "## Comments") {
+			t.Errorf("expected '## Comments' section, got: %s", contentStr)
+		}
+
+		// Verify first comment author and body appear
+		if !strings.Contains(contentStr, "commenter1") {
+			t.Errorf("expected comment author 'commenter1', got: %s", contentStr)
+		}
+		if !strings.Contains(contentStr, "This is the first comment") {
+			t.Errorf("expected first comment body, got: %s", contentStr)
+		}
+
+		// Verify second comment author and body appear
+		if !strings.Contains(contentStr, "commenter2") {
+			t.Errorf("expected comment author 'commenter2', got: %s", contentStr)
+		}
+		if !strings.Contains(contentStr, "This is the second comment with more detail") {
+			t.Errorf("expected second comment body, got: %s", contentStr)
+		}
+	})
+
+	// Unmount
+	if err := filesystem.Unmount(); err != nil {
+		t.Logf("unmount warning: %v", err)
+	}
+
+	select {
+	case err := <-mountErr:
+		if err != nil {
+			t.Logf("mount returned: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Log("mount did not return in time")
+	}
+}
+
 // TestE2E_OfflineMode tests that reads work when GitHub is unavailable
 func TestE2E_OfflineMode(t *testing.T) {
 	if os.Getuid() != 0 {
