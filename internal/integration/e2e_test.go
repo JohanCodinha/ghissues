@@ -5,7 +5,9 @@
 package integration
 
 import (
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -364,4 +366,549 @@ func TestE2E_OfflineMode(t *testing.T) {
 	filesystem.Unmount()
 	engine.Stop()
 	cacheDB.Close()
+}
+
+// TestE2E_LargeIssueWithManyComments tests handling of large issues with many comments
+func TestE2E_LargeIssueWithManyComments(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("FUSE tests require root or CAP_SYS_ADMIN")
+	}
+
+	mockGH := gh.NewMockServer()
+	defer mockGH.Close()
+
+	// Create a ~10KB body
+	largeBody := strings.Repeat("This is a line of content for the issue body. ", 200) // ~10KB
+
+	mockGH.AddIssue(&gh.Issue{
+		Number:    1,
+		Title:     "Large Issue with Many Comments",
+		Body:      largeBody,
+		State:     "open",
+		User:      gh.User{Login: "testuser"},
+		CreatedAt: time.Now().Add(-48 * time.Hour),
+		UpdatedAt: time.Now().Add(-1 * time.Hour),
+		ETag:      `"large-issue-etag"`,
+	})
+
+	// Add 50 comments
+	for i := 1; i <= 50; i++ {
+		mockGH.AddComment(1, &gh.Comment{
+			ID:        int64(i),
+			User:      gh.User{Login: fmt.Sprintf("commenter%d", i)},
+			Body:      fmt.Sprintf("This is comment number %d with some content.", i),
+			CreatedAt: time.Now().Add(-time.Duration(50-i) * time.Hour),
+			UpdatedAt: time.Now().Add(-time.Duration(50-i) * time.Hour),
+		})
+	}
+
+	tmpDir := t.TempDir()
+	mountpoint := filepath.Join(tmpDir, "mount")
+	cachePath := filepath.Join(tmpDir, "cache.db")
+	os.MkdirAll(mountpoint, 0755)
+
+	cacheDB, err := cache.InitDB(cachePath)
+	if err != nil {
+		t.Fatalf("failed to init cache: %v", err)
+	}
+	defer cacheDB.Close()
+
+	client := gh.NewWithBaseURL("test-token", mockGH.URL)
+	engine, err := sync.NewEngine(cacheDB, client, "test/repo", 100)
+	if err != nil {
+		t.Fatalf("failed to create sync engine: %v", err)
+	}
+	defer engine.Stop()
+
+	if err := engine.InitialSync(); err != nil {
+		t.Fatalf("initial sync failed: %v", err)
+	}
+
+	filesystem := fs.NewFS(cacheDB, "test/repo", mountpoint, func() {
+		engine.TriggerSync()
+	})
+
+	go filesystem.Mount()
+	time.Sleep(500 * time.Millisecond)
+	defer filesystem.Unmount()
+
+	t.Run("FileIsReadable", func(t *testing.T) {
+		entries, err := os.ReadDir(mountpoint)
+		if err != nil {
+			t.Fatalf("failed to read mountpoint: %v", err)
+		}
+		if len(entries) != 1 {
+			t.Fatalf("expected 1 file, got %d", len(entries))
+		}
+
+		content, err := os.ReadFile(filepath.Join(mountpoint, entries[0].Name()))
+		if err != nil {
+			t.Fatalf("failed to read file: %v", err)
+		}
+
+		// File should be readable and substantial in size
+		if len(content) < 10000 {
+			t.Errorf("expected file to be at least 10KB, got %d bytes", len(content))
+		}
+	})
+
+	t.Run("AllCommentsPresent", func(t *testing.T) {
+		entries, _ := os.ReadDir(mountpoint)
+		content, _ := os.ReadFile(filepath.Join(mountpoint, entries[0].Name()))
+		contentStr := string(content)
+
+		// Verify comments count in frontmatter
+		if !strings.Contains(contentStr, "comments: 50") {
+			t.Errorf("expected 'comments: 50' in frontmatter")
+		}
+
+		// Verify some sample comments are present
+		for _, num := range []int{1, 25, 50} {
+			expected := fmt.Sprintf("This is comment number %d", num)
+			if !strings.Contains(contentStr, expected) {
+				t.Errorf("expected to find comment %d, not found", num)
+			}
+		}
+	})
+
+	t.Run("PartialRead", func(t *testing.T) {
+		entries, _ := os.ReadDir(mountpoint)
+		filePath := filepath.Join(mountpoint, entries[0].Name())
+
+		// Open file and read only first 1KB
+		f, err := os.Open(filePath)
+		if err != nil {
+			t.Fatalf("failed to open file: %v", err)
+		}
+		defer f.Close()
+
+		buf := make([]byte, 1024)
+		n, err := f.Read(buf)
+		if err != nil {
+			t.Fatalf("failed to read partial content: %v", err)
+		}
+
+		if n != 1024 {
+			t.Errorf("expected to read 1024 bytes, got %d", n)
+		}
+
+		// First 1KB should contain the frontmatter
+		if !strings.Contains(string(buf), "---") {
+			t.Error("partial read should contain frontmatter marker")
+		}
+	})
+}
+
+// TestE2E_SimilarTitles tests that issues with similar titles are correctly distinguished
+func TestE2E_SimilarTitles(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("FUSE tests require root or CAP_SYS_ADMIN")
+	}
+
+	mockGH := gh.NewMockServer()
+	defer mockGH.Close()
+
+	// Create 3 issues with similar titles
+	mockGH.AddIssue(&gh.Issue{
+		Number:    1,
+		Title:     "Bug in login",
+		Body:      "Issue one body content",
+		State:     "open",
+		User:      gh.User{Login: "user1"},
+		CreatedAt: time.Now().Add(-3 * time.Hour),
+		UpdatedAt: time.Now().Add(-3 * time.Hour),
+		ETag:      `"similar-1"`,
+	})
+	mockGH.AddIssue(&gh.Issue{
+		Number:    2,
+		Title:     "Bug in login flow",
+		Body:      "Issue two body content",
+		State:     "open",
+		User:      gh.User{Login: "user2"},
+		CreatedAt: time.Now().Add(-2 * time.Hour),
+		UpdatedAt: time.Now().Add(-2 * time.Hour),
+		ETag:      `"similar-2"`,
+	})
+	mockGH.AddIssue(&gh.Issue{
+		Number:    3,
+		Title:     "Bug in login page",
+		Body:      "Issue three body content",
+		State:     "open",
+		User:      gh.User{Login: "user3"},
+		CreatedAt: time.Now().Add(-1 * time.Hour),
+		UpdatedAt: time.Now().Add(-1 * time.Hour),
+		ETag:      `"similar-3"`,
+	})
+
+	tmpDir := t.TempDir()
+	mountpoint := filepath.Join(tmpDir, "mount")
+	cachePath := filepath.Join(tmpDir, "cache.db")
+	os.MkdirAll(mountpoint, 0755)
+
+	cacheDB, err := cache.InitDB(cachePath)
+	if err != nil {
+		t.Fatalf("failed to init cache: %v", err)
+	}
+	defer cacheDB.Close()
+
+	client := gh.NewWithBaseURL("test-token", mockGH.URL)
+	engine, err := sync.NewEngine(cacheDB, client, "test/repo", 100)
+	if err != nil {
+		t.Fatalf("failed to create sync engine: %v", err)
+	}
+	defer engine.Stop()
+
+	if err := engine.InitialSync(); err != nil {
+		t.Fatalf("initial sync failed: %v", err)
+	}
+
+	filesystem := fs.NewFS(cacheDB, "test/repo", mountpoint, func() {
+		engine.TriggerSync()
+	})
+
+	go filesystem.Mount()
+	time.Sleep(500 * time.Millisecond)
+	defer filesystem.Unmount()
+
+	t.Run("AllThreeFilesListed", func(t *testing.T) {
+		entries, err := os.ReadDir(mountpoint)
+		if err != nil {
+			t.Fatalf("failed to read mountpoint: %v", err)
+		}
+		if len(entries) != 3 {
+			t.Fatalf("expected 3 files, got %d", len(entries))
+		}
+	})
+
+	t.Run("EachFileHasCorrectContent", func(t *testing.T) {
+		entries, _ := os.ReadDir(mountpoint)
+
+		// Map issue numbers to expected body content
+		expectedContent := map[int]string{
+			1: "Issue one body content",
+			2: "Issue two body content",
+			3: "Issue three body content",
+		}
+
+		for _, entry := range entries {
+			// Extract issue number from filename
+			var issueNum int
+			for num := 1; num <= 3; num++ {
+				if strings.Contains(entry.Name(), fmt.Sprintf("[%d].md", num)) {
+					issueNum = num
+					break
+				}
+			}
+
+			if issueNum == 0 {
+				t.Errorf("could not extract issue number from filename: %s", entry.Name())
+				continue
+			}
+
+			content, err := os.ReadFile(filepath.Join(mountpoint, entry.Name()))
+			if err != nil {
+				t.Errorf("failed to read file %s: %v", entry.Name(), err)
+				continue
+			}
+
+			expectedBody := expectedContent[issueNum]
+			if !strings.Contains(string(content), expectedBody) {
+				t.Errorf("file %s should contain '%s', got: %s", entry.Name(), expectedBody, string(content))
+			}
+		}
+	})
+}
+
+// TestE2E_EmptyIssue tests handling of issues with empty body
+func TestE2E_EmptyIssue(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("FUSE tests require root or CAP_SYS_ADMIN")
+	}
+
+	mockGH := gh.NewMockServer()
+	defer mockGH.Close()
+
+	// Create issue with empty body
+	mockGH.AddIssue(&gh.Issue{
+		Number:    1,
+		Title:     "Empty Body Issue",
+		Body:      "",
+		State:     "open",
+		User:      gh.User{Login: "testuser"},
+		CreatedAt: time.Now().Add(-1 * time.Hour),
+		UpdatedAt: time.Now().Add(-1 * time.Hour),
+		ETag:      `"empty-body-etag"`,
+	})
+
+	tmpDir := t.TempDir()
+	mountpoint := filepath.Join(tmpDir, "mount")
+	cachePath := filepath.Join(tmpDir, "cache.db")
+	os.MkdirAll(mountpoint, 0755)
+
+	cacheDB, err := cache.InitDB(cachePath)
+	if err != nil {
+		t.Fatalf("failed to init cache: %v", err)
+	}
+	defer cacheDB.Close()
+
+	client := gh.NewWithBaseURL("test-token", mockGH.URL)
+	engine, err := sync.NewEngine(cacheDB, client, "test/repo", 100)
+	if err != nil {
+		t.Fatalf("failed to create sync engine: %v", err)
+	}
+	defer engine.Stop()
+
+	if err := engine.InitialSync(); err != nil {
+		t.Fatalf("initial sync failed: %v", err)
+	}
+
+	filesystem := fs.NewFS(cacheDB, "test/repo", mountpoint, func() {
+		engine.TriggerSync()
+	})
+
+	go filesystem.Mount()
+	time.Sleep(500 * time.Millisecond)
+	defer filesystem.Unmount()
+
+	t.Run("FileIsReadable", func(t *testing.T) {
+		entries, err := os.ReadDir(mountpoint)
+		if err != nil {
+			t.Fatalf("failed to read mountpoint: %v", err)
+		}
+		if len(entries) != 1 {
+			t.Fatalf("expected 1 file, got %d", len(entries))
+		}
+
+		content, err := os.ReadFile(filepath.Join(mountpoint, entries[0].Name()))
+		if err != nil {
+			t.Fatalf("failed to read file: %v", err)
+		}
+
+		// Should still have frontmatter and title
+		if !strings.Contains(string(content), "# Empty Body Issue") {
+			t.Error("file should contain issue title")
+		}
+	})
+
+	t.Run("CanWriteContentToEmptyBody", func(t *testing.T) {
+		entries, _ := os.ReadDir(mountpoint)
+		filePath := filepath.Join(mountpoint, entries[0].Name())
+
+		// Read current content
+		content, _ := os.ReadFile(filePath)
+		contentStr := string(content)
+
+		// Find where the body section would be (after frontmatter and title)
+		// Add content after the title
+		newContent := strings.Replace(contentStr, "# Empty Body Issue", "# Empty Body Issue\n\nNew body content added here.", 1)
+
+		// Write back
+		if err := os.WriteFile(filePath, []byte(newContent), 0644); err != nil {
+			t.Fatalf("failed to write file: %v", err)
+		}
+
+		// Wait for sync
+		time.Sleep(300 * time.Millisecond)
+
+		// Verify mock server received update
+		issue := mockGH.GetIssue(1)
+		if issue == nil {
+			t.Fatal("issue not found in mock server")
+		}
+		if !strings.Contains(issue.Body, "New body content added here") {
+			t.Errorf("sync did not update issue body: %s", issue.Body)
+		}
+	})
+}
+
+// TestE2E_GrepAcrossFiles tests using grep command on mounted files
+func TestE2E_GrepAcrossFiles(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("FUSE tests require root or CAP_SYS_ADMIN")
+	}
+
+	mockGH := gh.NewMockServer()
+	defer mockGH.Close()
+
+	// Create 3 issues, 2 containing "SEARCH_TERM", 1 without
+	mockGH.AddIssue(&gh.Issue{
+		Number:    1,
+		Title:     "Issue with search term",
+		Body:      "This issue contains SEARCH_TERM in the body",
+		State:     "open",
+		User:      gh.User{Login: "user1"},
+		CreatedAt: time.Now().Add(-3 * time.Hour),
+		UpdatedAt: time.Now().Add(-3 * time.Hour),
+		ETag:      `"grep-1"`,
+	})
+	mockGH.AddIssue(&gh.Issue{
+		Number:    2,
+		Title:     "Issue without the term",
+		Body:      "This issue does not contain it",
+		State:     "open",
+		User:      gh.User{Login: "user2"},
+		CreatedAt: time.Now().Add(-2 * time.Hour),
+		UpdatedAt: time.Now().Add(-2 * time.Hour),
+		ETag:      `"grep-2"`,
+	})
+	mockGH.AddIssue(&gh.Issue{
+		Number:    3,
+		Title:     "Another with search term",
+		Body:      "Also has SEARCH_TERM in the content",
+		State:     "open",
+		User:      gh.User{Login: "user3"},
+		CreatedAt: time.Now().Add(-1 * time.Hour),
+		UpdatedAt: time.Now().Add(-1 * time.Hour),
+		ETag:      `"grep-3"`,
+	})
+
+	tmpDir := t.TempDir()
+	mountpoint := filepath.Join(tmpDir, "mount")
+	cachePath := filepath.Join(tmpDir, "cache.db")
+	os.MkdirAll(mountpoint, 0755)
+
+	cacheDB, err := cache.InitDB(cachePath)
+	if err != nil {
+		t.Fatalf("failed to init cache: %v", err)
+	}
+	defer cacheDB.Close()
+
+	client := gh.NewWithBaseURL("test-token", mockGH.URL)
+	engine, err := sync.NewEngine(cacheDB, client, "test/repo", 100)
+	if err != nil {
+		t.Fatalf("failed to create sync engine: %v", err)
+	}
+	defer engine.Stop()
+
+	if err := engine.InitialSync(); err != nil {
+		t.Fatalf("initial sync failed: %v", err)
+	}
+
+	filesystem := fs.NewFS(cacheDB, "test/repo", mountpoint, func() {
+		engine.TriggerSync()
+	})
+
+	go filesystem.Mount()
+	time.Sleep(500 * time.Millisecond)
+	defer filesystem.Unmount()
+
+	t.Run("GrepFindsExactlyTwoFiles", func(t *testing.T) {
+		// Use shell to expand glob pattern
+		cmd := exec.Command("sh", "-c", fmt.Sprintf("grep -l SEARCH_TERM %s/*.md", mountpoint))
+		output, err := cmd.Output()
+		if err != nil {
+			// grep returns exit code 1 if no matches, but we expect matches
+			if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() != 1 {
+				t.Fatalf("grep command failed: %v, stderr: %s", err, exitErr.Stderr)
+			}
+		}
+
+		// Count the number of files found
+		outputStr := strings.TrimSpace(string(output))
+		if outputStr == "" {
+			t.Fatal("grep found no files")
+		}
+
+		files := strings.Split(outputStr, "\n")
+		if len(files) != 2 {
+			t.Errorf("expected grep to find 2 files, found %d: %v", len(files), files)
+		}
+	})
+}
+
+// TestE2E_FindCommand tests using find command on mounted filesystem
+func TestE2E_FindCommand(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("FUSE tests require root or CAP_SYS_ADMIN")
+	}
+
+	mockGH := gh.NewMockServer()
+	defer mockGH.Close()
+
+	// Create 3 issues
+	mockGH.AddIssue(&gh.Issue{
+		Number:    1,
+		Title:     "First Issue",
+		Body:      "First issue body",
+		State:     "open",
+		User:      gh.User{Login: "user1"},
+		CreatedAt: time.Now().Add(-3 * time.Hour),
+		UpdatedAt: time.Now().Add(-3 * time.Hour),
+		ETag:      `"find-1"`,
+	})
+	mockGH.AddIssue(&gh.Issue{
+		Number:    2,
+		Title:     "Second Issue",
+		Body:      "Second issue body",
+		State:     "open",
+		User:      gh.User{Login: "user2"},
+		CreatedAt: time.Now().Add(-2 * time.Hour),
+		UpdatedAt: time.Now().Add(-2 * time.Hour),
+		ETag:      `"find-2"`,
+	})
+	mockGH.AddIssue(&gh.Issue{
+		Number:    3,
+		Title:     "Third Issue",
+		Body:      "Third issue body",
+		State:     "open",
+		User:      gh.User{Login: "user3"},
+		CreatedAt: time.Now().Add(-1 * time.Hour),
+		UpdatedAt: time.Now().Add(-1 * time.Hour),
+		ETag:      `"find-3"`,
+	})
+
+	tmpDir := t.TempDir()
+	mountpoint := filepath.Join(tmpDir, "mount")
+	cachePath := filepath.Join(tmpDir, "cache.db")
+	os.MkdirAll(mountpoint, 0755)
+
+	cacheDB, err := cache.InitDB(cachePath)
+	if err != nil {
+		t.Fatalf("failed to init cache: %v", err)
+	}
+	defer cacheDB.Close()
+
+	client := gh.NewWithBaseURL("test-token", mockGH.URL)
+	engine, err := sync.NewEngine(cacheDB, client, "test/repo", 100)
+	if err != nil {
+		t.Fatalf("failed to create sync engine: %v", err)
+	}
+	defer engine.Stop()
+
+	if err := engine.InitialSync(); err != nil {
+		t.Fatalf("initial sync failed: %v", err)
+	}
+
+	filesystem := fs.NewFS(cacheDB, "test/repo", mountpoint, func() {
+		engine.TriggerSync()
+	})
+
+	go filesystem.Mount()
+	time.Sleep(500 * time.Millisecond)
+	defer filesystem.Unmount()
+
+	t.Run("FindReturnsThreeFiles", func(t *testing.T) {
+		cmd := exec.Command("find", mountpoint, "-name", "*.md")
+		output, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("find command failed: %v", err)
+		}
+
+		outputStr := strings.TrimSpace(string(output))
+		if outputStr == "" {
+			t.Fatal("find found no files")
+		}
+
+		files := strings.Split(outputStr, "\n")
+		if len(files) != 3 {
+			t.Errorf("expected find to return 3 files, got %d: %v", len(files), files)
+		}
+
+		// Verify all files end with .md
+		for _, file := range files {
+			if !strings.HasSuffix(file, ".md") {
+				t.Errorf("expected file to end with .md, got: %s", file)
+			}
+		}
+	})
 }

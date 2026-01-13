@@ -744,3 +744,263 @@ func TestRoundTrip_WithComments_BodyNotContaminated(t *testing.T) {
 		t.Error("parsed body should contain original body content")
 	}
 }
+
+// Edge case tests
+
+func TestToMarkdown_LargeIssueWithManyComments(t *testing.T) {
+	// Create ~1.5KB body by repeating text
+	bodyChunk := "This is some repeated text for the issue body. "
+	var bodyBuilder strings.Builder
+	for bodyBuilder.Len() < 1500 {
+		bodyBuilder.WriteString(bodyChunk)
+	}
+	largeBody := bodyBuilder.String()
+
+	issue := &cache.Issue{
+		Number:    999,
+		Repo:      "test/large-issue",
+		Title:     "Large Issue Test",
+		Body:      largeBody,
+		State:     "open",
+		Author:    "alice",
+		CreatedAt: "2026-01-01T00:00:00Z",
+		UpdatedAt: "2026-01-10T00:00:00Z",
+	}
+
+	// Create 100 comments
+	comments := make([]cache.Comment, 100)
+	for i := 0; i < 100; i++ {
+		comments[i] = cache.Comment{
+			ID:        int64(1000 + i),
+			Author:    "commenter",
+			Body:      "This is comment number " + string(rune('0'+i%10)),
+			CreatedAt: "2026-01-10T10:00:00Z",
+		}
+	}
+
+	result := ToMarkdown(issue, comments)
+
+	// Verify comments: 100 in frontmatter
+	if !strings.Contains(result, "comments: 100") {
+		t.Error("expected comments: 100 in frontmatter")
+	}
+
+	// Verify last comment is present (comment_id: 1099)
+	if !strings.Contains(result, "<!-- comment_id: 1099 -->") {
+		t.Error("expected last comment (id 1099) to be present")
+	}
+
+	// Verify reasonable size (10-20KB range)
+	size := len(result)
+	if size < 10000 || size > 20000 {
+		t.Errorf("expected output size between 10-20KB, got %d bytes", size)
+	}
+}
+
+func TestFromMarkdown_BodyWithNestedMarkdown(t *testing.T) {
+	content := `---
+id: 1
+repo: test/repo
+---
+
+# Title
+
+## Body
+
+Introduction paragraph.
+
+### Sub-heading (should stay in body)
+
+Some content under sub-heading.
+
+` + "```go" + `
+func main() {
+    fmt.Println("Hello")
+}
+` + "```" + `
+
+> This is a blockquote
+> spanning multiple lines
+
+- List item 1
+- List item 2
+  - Nested item
+
+End of body.
+
+## Comments
+
+### 2026-01-10T14:12:00Z - alice
+<!-- comment_id: 100 -->
+
+This comment should NOT appear in body.
+`
+
+	parsed, err := FromMarkdown(content)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Verify sub-headings preserved in body
+	if !strings.Contains(parsed.Body, "### Sub-heading") {
+		t.Error("sub-heading should be preserved in body")
+	}
+
+	// Verify code blocks preserved
+	if !strings.Contains(parsed.Body, "```go") {
+		t.Error("code block opening should be preserved")
+	}
+	if !strings.Contains(parsed.Body, "fmt.Println") {
+		t.Error("code block content should be preserved")
+	}
+
+	// Verify blockquotes preserved
+	if !strings.Contains(parsed.Body, "> This is a blockquote") {
+		t.Error("blockquote should be preserved in body")
+	}
+
+	// Verify lists preserved
+	if !strings.Contains(parsed.Body, "- List item 1") {
+		t.Error("list items should be preserved in body")
+	}
+	if !strings.Contains(parsed.Body, "  - Nested item") {
+		t.Error("nested list items should be preserved in body")
+	}
+
+	// Verify comment section NOT in body
+	if strings.Contains(parsed.Body, "## Comments") {
+		t.Error("## Comments section should not be in body")
+	}
+	if strings.Contains(parsed.Body, "This comment should NOT appear") {
+		t.Error("comment content should not be in body")
+	}
+}
+
+func TestToMarkdown_UnicodeContent(t *testing.T) {
+	issue := &cache.Issue{
+		Number: 1,
+		Repo:   "test/unicode",
+		Title:  "Unicode test: cafe, nihao, privet, emoji ",
+		Body:   "Body with unicode: cafe nihao privet emojis   ",
+		State:  "open",
+		Author: "user",
+	}
+
+	result := ToMarkdown(issue)
+
+	// Verify unicode preserved in title
+	if !strings.Contains(result, "cafe") {
+		t.Error("unicode 'cafe' should be preserved in title")
+	}
+	if !strings.Contains(result, "nihao") {
+		t.Error("unicode 'nihao' should be preserved in title")
+	}
+	if !strings.Contains(result, "privet") {
+		t.Error("unicode 'privet' should be preserved in title")
+	}
+	if !strings.Contains(result, "") {
+		t.Error("emoji should be preserved in title")
+	}
+
+	// Verify unicode preserved in body
+	if !strings.Contains(result, "emojis   ") {
+		t.Error("emojis should be preserved in body")
+	}
+}
+
+func TestFromMarkdown_WindowsLineEndings(t *testing.T) {
+	// Content with \r\n line endings (Windows style)
+	content := "---\r\nid: 1\r\nrepo: test/repo\r\n---\r\n\r\n# Windows Line Endings Test\r\n\r\n## Body\r\n\r\nThis content uses Windows line endings.\r\n\r\nSecond paragraph."
+
+	parsed, err := FromMarkdown(content)
+	if err != nil {
+		t.Fatalf("unexpected error parsing Windows line endings: %v", err)
+	}
+
+	if parsed.Number != 1 {
+		t.Errorf("expected Number 1, got %d", parsed.Number)
+	}
+	if parsed.Repo != "test/repo" {
+		t.Errorf("expected Repo 'test/repo', got %q", parsed.Repo)
+	}
+	if parsed.Title != "Windows Line Endings Test" {
+		t.Errorf("expected title 'Windows Line Endings Test', got %q", parsed.Title)
+	}
+	if !strings.Contains(parsed.Body, "Windows line endings") {
+		t.Error("body should contain expected content")
+	}
+}
+
+func TestToMarkdown_VeryLongTitle(t *testing.T) {
+	// Create a 200-character title
+	longTitle := strings.Repeat("A", 200)
+
+	issue := &cache.Issue{
+		Number: 1,
+		Repo:   "test/repo",
+		Title:  longTitle,
+		Body:   "Body content",
+		State:  "open",
+	}
+
+	result := ToMarkdown(issue)
+
+	// Verify the full long title is in the output
+	if !strings.Contains(result, "# "+longTitle) {
+		t.Error("long title should be fully rendered")
+	}
+
+	// Verify the markdown is still valid (has proper structure)
+	if !strings.HasPrefix(result, "---\n") {
+		t.Error("markdown should still start with frontmatter")
+	}
+	if !strings.Contains(result, "## Body") {
+		t.Error("markdown should still have ## Body section")
+	}
+
+	// Verify we can parse it back
+	parsed, err := FromMarkdown(result)
+	if err != nil {
+		t.Fatalf("failed to parse markdown with long title: %v", err)
+	}
+	if parsed.Title != longTitle {
+		t.Errorf("title not preserved: expected %d chars, got %d chars", len(longTitle), len(parsed.Title))
+	}
+}
+
+func TestFromMarkdown_CodeBlockWithYamlLikeSyntax(t *testing.T) {
+	content := `---
+id: 1
+repo: test/repo
+---
+
+# Title
+
+## Body
+
+Here's a config example:
+
+` + "```yaml" + `
+---
+config:
+  key: value
+---
+` + "```" + `
+
+End of body.
+`
+	parsed, err := FromMarkdown(content)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if !strings.Contains(parsed.Body, "config:") {
+		t.Error("code block content should be in body")
+	}
+	if !strings.Contains(parsed.Body, "key: value") {
+		t.Error("YAML-like content inside code block should be preserved")
+	}
+	if !strings.Contains(parsed.Body, "End of body.") {
+		t.Error("content after code block should be preserved")
+	}
+}

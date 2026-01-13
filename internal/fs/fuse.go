@@ -23,6 +23,19 @@ const (
 	maxTitleLength = 50
 )
 
+// parseIssueTime parses an RFC3339 timestamp string and returns the time.
+// If the timestamp is empty or invalid, it returns the current time as a fallback.
+func parseIssueTime(timestamp string) time.Time {
+	if timestamp == "" {
+		return time.Now()
+	}
+	t, err := time.Parse(time.RFC3339, timestamp)
+	if err != nil {
+		return time.Now()
+	}
+	return t
+}
+
 // filenameRegex matches issue filenames in the format: title[number].md
 var filenameRegex = regexp.MustCompile(`^(.+)\[(\d+)\]\.md$`)
 
@@ -227,9 +240,10 @@ func (r *rootNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) 
 	out.Size = uint64(len(content))
 	out.Ino = uint64(issue.Number)
 
-	// Set times
-	now := time.Now()
-	out.SetTimes(&now, &now, &now)
+	// Set times from issue timestamps
+	mtime := parseIssueTime(issue.UpdatedAt)
+	ctime := parseIssueTime(issue.CreatedAt)
+	out.SetTimes(&mtime, &mtime, &ctime)
 
 	// Create the file node
 	fileNode := &issueFileNode{
@@ -284,9 +298,10 @@ func (f *issueFileNode) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse
 	out.Size = uint64(len(content))
 	out.Ino = uint64(f.number)
 
-	// Set times
-	now := time.Now()
-	out.SetTimes(&now, &now, &now)
+	// Set times from issue timestamps
+	mtime := parseIssueTime(issue.UpdatedAt)
+	ctime := parseIssueTime(issue.CreatedAt)
+	out.SetTimes(&mtime, &mtime, &ctime)
 
 	return 0
 }
@@ -295,7 +310,7 @@ func (f *issueFileNode) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse
 func (f *issueFileNode) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
 	// Handle truncate if requested
 	if sz, ok := in.GetSize(); ok {
-		// If there's an open file handle, update its buffer
+		// If there's an open file handle, update its buffer and report the new size
 		if handle, ok := fh.(*issueFileHandle); ok {
 			handle.mu.Lock()
 			if sz == 0 {
@@ -304,11 +319,30 @@ func (f *issueFileNode) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.
 				handle.buffer = handle.buffer[:sz]
 			}
 			handle.dirty = true
+			// Use the buffer size we just set, not a cache lookup
+			newSize := uint64(len(handle.buffer))
 			handle.mu.Unlock()
+
+			out.Mode = 0644
+			out.Ino = uint64(f.number)
+			out.Size = newSize
+
+			now := time.Now()
+			out.SetTimes(&now, &now, &now)
+			return 0
 		}
+
+		// No file handle - use the requested size directly
+		out.Mode = 0644
+		out.Ino = uint64(f.number)
+		out.Size = sz
+
+		now := time.Now()
+		out.SetTimes(&now, &now, &now)
+		return 0
 	}
 
-	// Update attributes in out
+	// No truncate requested - get current size from cache
 	issue, err := f.cache.GetIssue(f.repo, f.number)
 	if err != nil || issue == nil {
 		return syscall.EIO
@@ -317,21 +351,18 @@ func (f *issueFileNode) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.
 	out.Mode = 0644
 	out.Ino = uint64(f.number)
 
-	now := time.Now()
-	out.SetTimes(&now, &now, &now)
+	// Set times from issue timestamps
+	mtime := parseIssueTime(issue.UpdatedAt)
+	ctime := parseIssueTime(issue.CreatedAt)
+	out.SetTimes(&mtime, &mtime, &ctime)
 
-	// If truncating, report the new size
-	if sz, ok := in.GetSize(); ok {
-		out.Size = sz
-	} else {
-		// Get comments from the cache
-		comments, err := f.cache.GetComments(f.repo, f.number)
-		if err != nil {
-			comments = []cache.Comment{} // Use empty slice on error
-		}
-		content := md.ToMarkdown(issue, comments)
-		out.Size = uint64(len(content))
+	// Get comments from the cache
+	comments, err := f.cache.GetComments(f.repo, f.number)
+	if err != nil {
+		comments = []cache.Comment{} // Use empty slice on error
 	}
+	content := md.ToMarkdown(issue, comments)
+	out.Size = uint64(len(content))
 
 	return 0
 }

@@ -197,24 +197,28 @@ func (c *Client) ListIssues(owner, repo string) ([]Issue, error) {
 		if err != nil {
 			return nil, err
 		}
-		defer resp.Body.Close()
 
 		checkRateLimit(resp)
 
 		if resp.StatusCode != http.StatusOK {
 			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
 			return nil, fmt.Errorf("GitHub API error: %s - %s", resp.Status, string(body))
 		}
 
 		var issues []Issue
 		if err := json.NewDecoder(resp.Body).Decode(&issues); err != nil {
+			resp.Body.Close()
 			return nil, fmt.Errorf("failed to decode response: %w", err)
 		}
 
-		allIssues = append(allIssues, issues...)
-
-		// Parse Link header for pagination
+		// Parse Link header for pagination before closing
 		url = getNextPageURL(resp.Header.Get("Link"))
+
+		// Close response body immediately after reading
+		resp.Body.Close()
+
+		allIssues = append(allIssues, issues...)
 	}
 
 	return allIssues, nil
@@ -303,24 +307,28 @@ func (c *Client) ListComments(owner, repo string, number int) ([]Comment, error)
 		if err != nil {
 			return nil, err
 		}
-		defer resp.Body.Close()
 
 		checkRateLimit(resp)
 
 		if resp.StatusCode != http.StatusOK {
 			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
 			return nil, fmt.Errorf("GitHub API error: %s - %s", resp.Status, string(body))
 		}
 
 		var comments []Comment
 		if err := json.NewDecoder(resp.Body).Decode(&comments); err != nil {
+			resp.Body.Close()
 			return nil, fmt.Errorf("failed to decode response: %w", err)
 		}
 
-		allComments = append(allComments, comments...)
-
-		// Parse Link header for pagination
+		// Parse Link header for pagination before closing
 		url = getNextPageURL(resp.Header.Get("Link"))
+
+		// Close response body immediately after reading
+		resp.Body.Close()
+
+		allComments = append(allComments, comments...)
 	}
 
 	return allComments, nil

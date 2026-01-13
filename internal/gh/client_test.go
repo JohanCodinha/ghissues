@@ -5,7 +5,478 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
+
+// =============================================================================
+// Mock Server Tests (Unit Tests)
+// =============================================================================
+
+// TestUpdateIssue_Success tests successful issue update via mock server
+func TestUpdateIssue_Success(t *testing.T) {
+	mockGH := NewMockServer()
+	defer mockGH.Close()
+
+	// Add an issue to update
+	mockGH.AddIssue(&Issue{
+		Number:    42,
+		Title:     "Original Title",
+		Body:      "Original body",
+		State:     "open",
+		User:      User{Login: "testuser"},
+		CreatedAt: time.Now().Add(-time.Hour),
+		UpdatedAt: time.Now().Add(-time.Hour),
+		ETag:      `"original-etag"`,
+	})
+
+	client := NewWithBaseURL("test-token", mockGH.URL)
+
+	// Update the issue
+	err := client.UpdateIssue("owner", "repo", 42, "New updated body")
+	if err != nil {
+		t.Fatalf("UpdateIssue() unexpected error: %v", err)
+	}
+
+	// Verify the issue was updated in the mock server
+	updated := mockGH.GetIssue(42)
+	if updated.Body != "New updated body" {
+		t.Errorf("Expected body 'New updated body', got '%s'", updated.Body)
+	}
+}
+
+// TestUpdateIssue_NotFound tests 404 response when issue doesn't exist
+func TestUpdateIssue_NotFound(t *testing.T) {
+	mockGH := NewMockServer()
+	defer mockGH.Close()
+
+	client := NewWithBaseURL("test-token", mockGH.URL)
+
+	// Try to update a non-existent issue
+	err := client.UpdateIssue("owner", "repo", 999, "Some body")
+	if err == nil {
+		t.Fatal("UpdateIssue() expected error for non-existent issue, got nil")
+	}
+
+	if !strings.Contains(err.Error(), "404") && !strings.Contains(err.Error(), "Not Found") {
+		t.Errorf("Expected 404/Not Found error, got: %v", err)
+	}
+}
+
+// TestUpdateIssue_ValidationError tests 422 response for validation errors
+func TestUpdateIssue_ValidationError(t *testing.T) {
+	mockGH := NewMockServer()
+	defer mockGH.Close()
+
+	// Add an issue first
+	mockGH.AddIssue(&Issue{
+		Number: 42,
+		Title:  "Test Issue",
+		Body:   "Test body",
+		State:  "open",
+		ETag:   `"test-etag"`,
+	})
+
+	// Force a 422 validation error
+	mockGH.SetNextError(422, `{"message":"Validation Failed","errors":[{"resource":"Issue","field":"body","code":"invalid"}]}`)
+
+	client := NewWithBaseURL("test-token", mockGH.URL)
+
+	err := client.UpdateIssue("owner", "repo", 42, "Invalid body content")
+	if err == nil {
+		t.Fatal("UpdateIssue() expected validation error, got nil")
+	}
+
+	if !strings.Contains(err.Error(), "422") && !strings.Contains(err.Error(), "Validation") {
+		t.Errorf("Expected 422/Validation error, got: %v", err)
+	}
+}
+
+// TestUpdateIssue_RequestBody verifies the request body contains correct JSON
+func TestUpdateIssue_RequestBody(t *testing.T) {
+	mockGH := NewMockServer()
+	defer mockGH.Close()
+
+	// Add an issue
+	mockGH.AddIssue(&Issue{
+		Number: 1,
+		Title:  "Test Issue",
+		Body:   "Original body",
+		State:  "open",
+		ETag:   `"test-etag"`,
+	})
+
+	client := NewWithBaseURL("test-token", mockGH.URL)
+
+	newBody := "This is the new body content with special chars: <>&\""
+	err := client.UpdateIssue("owner", "repo", 1, newBody)
+	if err != nil {
+		t.Fatalf("UpdateIssue() unexpected error: %v", err)
+	}
+
+	// Verify the body was correctly updated (proves JSON was correctly encoded)
+	updated := mockGH.GetIssue(1)
+	if updated.Body != newBody {
+		t.Errorf("Expected body %q, got %q", newBody, updated.Body)
+	}
+}
+
+// TestGetIssueWithEtag_NotModified tests 304 Not Modified response
+func TestGetIssueWithEtag_NotModified(t *testing.T) {
+	mockGH := NewMockServer()
+	defer mockGH.Close()
+
+	originalEtag := `"abc123"`
+	mockGH.AddIssue(&Issue{
+		Number:    42,
+		Title:     "Test Issue",
+		Body:      "Test body",
+		State:     "open",
+		User:      User{Login: "testuser"},
+		CreatedAt: time.Now().Add(-time.Hour),
+		UpdatedAt: time.Now().Add(-time.Hour),
+		ETag:      originalEtag,
+	})
+
+	client := NewWithBaseURL("test-token", mockGH.URL)
+
+	// Request with matching ETag should return 304
+	issue, newEtag, err := client.GetIssueWithEtag("owner", "repo", 42, originalEtag)
+
+	if err != nil {
+		t.Fatalf("GetIssueWithEtag() unexpected error: %v", err)
+	}
+
+	if issue != nil {
+		t.Errorf("Expected nil issue for 304 response, got: %+v", issue)
+	}
+
+	if newEtag != "" {
+		t.Errorf("Expected empty ETag for 304 response, got: %s", newEtag)
+	}
+}
+
+// TestGetIssueWithEtag_Modified tests 200 OK with new data
+func TestGetIssueWithEtag_Modified(t *testing.T) {
+	mockGH := NewMockServer()
+	defer mockGH.Close()
+
+	originalEtag := `"abc123"`
+	newEtagValue := `"xyz789"`
+	mockGH.AddIssue(&Issue{
+		Number:    42,
+		Title:     "Updated Title",
+		Body:      "Updated body",
+		State:     "open",
+		User:      User{Login: "testuser"},
+		CreatedAt: time.Now().Add(-time.Hour),
+		UpdatedAt: time.Now(),
+		ETag:      newEtagValue,
+	})
+
+	client := NewWithBaseURL("test-token", mockGH.URL)
+
+	// Request with different ETag should return full issue
+	issue, newEtag, err := client.GetIssueWithEtag("owner", "repo", 42, originalEtag)
+
+	if err != nil {
+		t.Fatalf("GetIssueWithEtag() unexpected error: %v", err)
+	}
+
+	if issue == nil {
+		t.Fatal("Expected issue for 200 response, got nil")
+	}
+
+	if issue.Title != "Updated Title" {
+		t.Errorf("Expected title 'Updated Title', got '%s'", issue.Title)
+	}
+
+	if newEtag != newEtagValue {
+		t.Errorf("Expected ETag %s, got %s", newEtagValue, newEtag)
+	}
+
+	// Issue's ETag field should also be set
+	if issue.ETag != newEtagValue {
+		t.Errorf("Expected issue.ETag %s, got %s", newEtagValue, issue.ETag)
+	}
+}
+
+// TestGetIssueWithEtag_NoEtag tests request without ETag
+func TestGetIssueWithEtag_NoEtag(t *testing.T) {
+	mockGH := NewMockServer()
+	defer mockGH.Close()
+
+	expectedEtag := `"fresh-etag"`
+	mockGH.AddIssue(&Issue{
+		Number:    42,
+		Title:     "Test Issue",
+		Body:      "Test body",
+		State:     "open",
+		User:      User{Login: "testuser"},
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+		ETag:      expectedEtag,
+	})
+
+	client := NewWithBaseURL("test-token", mockGH.URL)
+
+	// Request without ETag should always return full issue
+	issue, newEtag, err := client.GetIssueWithEtag("owner", "repo", 42, "")
+
+	if err != nil {
+		t.Fatalf("GetIssueWithEtag() unexpected error: %v", err)
+	}
+
+	if issue == nil {
+		t.Fatal("Expected issue, got nil")
+	}
+
+	if newEtag != expectedEtag {
+		t.Errorf("Expected ETag %s, got %s", expectedEtag, newEtag)
+	}
+}
+
+// TestListIssues_Pagination tests multi-page issue listing
+func TestListIssues_Pagination(t *testing.T) {
+	mockGH := NewMockServer()
+	defer mockGH.Close()
+
+	// Add 9 issues
+	for i := 1; i <= 9; i++ {
+		mockGH.AddIssue(&Issue{
+			Number:    i,
+			Title:     fmt.Sprintf("Issue #%d", i),
+			Body:      fmt.Sprintf("Body for issue %d", i),
+			State:     "open",
+			User:      User{Login: "testuser"},
+			CreatedAt: time.Now(),
+			UpdatedAt: time.Now(),
+			ETag:      fmt.Sprintf(`"etag-%d"`, i),
+		})
+	}
+
+	// Set pagination to 3 issues per page (3 pages total)
+	mockGH.SetIssuesPerPage(3)
+
+	client := NewWithBaseURL("test-token", mockGH.URL)
+
+	issues, err := client.ListIssues("owner", "repo")
+	if err != nil {
+		t.Fatalf("ListIssues() unexpected error: %v", err)
+	}
+
+	if len(issues) != 9 {
+		t.Errorf("Expected 9 issues, got %d", len(issues))
+	}
+
+	// Verify all issues are present
+	seen := make(map[int]bool)
+	for _, issue := range issues {
+		seen[issue.Number] = true
+	}
+	for i := 1; i <= 9; i++ {
+		if !seen[i] {
+			t.Errorf("Missing issue #%d in results", i)
+		}
+	}
+}
+
+// TestListIssues_SinglePage tests when all issues fit in one page
+func TestListIssues_SinglePage(t *testing.T) {
+	mockGH := NewMockServer()
+	defer mockGH.Close()
+
+	// Add 3 issues
+	for i := 1; i <= 3; i++ {
+		mockGH.AddIssue(&Issue{
+			Number:    i,
+			Title:     fmt.Sprintf("Issue #%d", i),
+			Body:      fmt.Sprintf("Body for issue %d", i),
+			State:     "open",
+			User:      User{Login: "testuser"},
+			CreatedAt: time.Now(),
+			UpdatedAt: time.Now(),
+			ETag:      fmt.Sprintf(`"etag-%d"`, i),
+		})
+	}
+
+	// No pagination (default)
+	client := NewWithBaseURL("test-token", mockGH.URL)
+
+	issues, err := client.ListIssues("owner", "repo")
+	if err != nil {
+		t.Fatalf("ListIssues() unexpected error: %v", err)
+	}
+
+	if len(issues) != 3 {
+		t.Errorf("Expected 3 issues, got %d", len(issues))
+	}
+}
+
+// TestListComments_Pagination tests multi-page comment listing
+func TestListComments_Pagination(t *testing.T) {
+	mockGH := NewMockServer()
+	defer mockGH.Close()
+
+	// Add an issue first
+	mockGH.AddIssue(&Issue{
+		Number: 1,
+		Title:  "Issue with comments",
+		Body:   "Issue body",
+		State:  "open",
+		ETag:   `"issue-etag"`,
+	})
+
+	// Add 7 comments
+	for i := 1; i <= 7; i++ {
+		mockGH.AddComment(1, &Comment{
+			ID:        int64(i),
+			User:      User{Login: fmt.Sprintf("user%d", i)},
+			Body:      fmt.Sprintf("Comment #%d", i),
+			CreatedAt: time.Now(),
+			UpdatedAt: time.Now(),
+		})
+	}
+
+	// Set pagination to 2 comments per page (4 pages total)
+	mockGH.SetCommentsPerPage(2)
+
+	client := NewWithBaseURL("test-token", mockGH.URL)
+
+	comments, err := client.ListComments("owner", "repo", 1)
+	if err != nil {
+		t.Fatalf("ListComments() unexpected error: %v", err)
+	}
+
+	if len(comments) != 7 {
+		t.Errorf("Expected 7 comments, got %d", len(comments))
+	}
+
+	// Verify all comments are present
+	seen := make(map[int64]bool)
+	for _, comment := range comments {
+		seen[comment.ID] = true
+	}
+	for i := int64(1); i <= 7; i++ {
+		if !seen[i] {
+			t.Errorf("Missing comment #%d in results", i)
+		}
+	}
+}
+
+// TestListComments_Empty tests listing comments when none exist
+func TestListComments_Empty(t *testing.T) {
+	mockGH := NewMockServer()
+	defer mockGH.Close()
+
+	// Add an issue with no comments
+	mockGH.AddIssue(&Issue{
+		Number: 1,
+		Title:  "Issue without comments",
+		Body:   "Issue body",
+		State:  "open",
+		ETag:   `"issue-etag"`,
+	})
+
+	client := NewWithBaseURL("test-token", mockGH.URL)
+
+	comments, err := client.ListComments("owner", "repo", 1)
+	if err != nil {
+		t.Fatalf("ListComments() unexpected error: %v", err)
+	}
+
+	if len(comments) != 0 {
+		t.Errorf("Expected 0 comments, got %d", len(comments))
+	}
+}
+
+// TestGetIssue_WithMock tests GetIssue with mock server
+func TestGetIssue_WithMock(t *testing.T) {
+	mockGH := NewMockServer()
+	defer mockGH.Close()
+
+	expectedEtag := `"test-etag-123"`
+	mockGH.AddIssue(&Issue{
+		Number:    42,
+		Title:     "Test Issue Title",
+		Body:      "Test issue body content",
+		State:     "open",
+		User:      User{Login: "author"},
+		Labels:    []Label{{Name: "bug", Color: "ff0000"}},
+		CreatedAt: time.Date(2024, 1, 15, 10, 0, 0, 0, time.UTC),
+		UpdatedAt: time.Date(2024, 1, 16, 12, 0, 0, 0, time.UTC),
+		ETag:      expectedEtag,
+	})
+
+	client := NewWithBaseURL("test-token", mockGH.URL)
+
+	issue, etag, err := client.GetIssue("owner", "repo", 42)
+	if err != nil {
+		t.Fatalf("GetIssue() unexpected error: %v", err)
+	}
+
+	if issue == nil {
+		t.Fatal("Expected issue, got nil")
+	}
+
+	if issue.Number != 42 {
+		t.Errorf("Expected issue number 42, got %d", issue.Number)
+	}
+
+	if issue.Title != "Test Issue Title" {
+		t.Errorf("Expected title 'Test Issue Title', got '%s'", issue.Title)
+	}
+
+	if etag != expectedEtag {
+		t.Errorf("Expected ETag %s, got %s", expectedEtag, etag)
+	}
+}
+
+// TestGetIssue_NotFound tests 404 response
+func TestGetIssue_NotFound(t *testing.T) {
+	mockGH := NewMockServer()
+	defer mockGH.Close()
+
+	client := NewWithBaseURL("test-token", mockGH.URL)
+
+	issue, etag, err := client.GetIssue("owner", "repo", 9999)
+
+	if err == nil {
+		t.Fatal("Expected error for non-existent issue, got nil")
+	}
+
+	if issue != nil {
+		t.Errorf("Expected nil issue, got %+v", issue)
+	}
+
+	if etag != "" {
+		t.Errorf("Expected empty ETag, got %s", etag)
+	}
+
+	if !strings.Contains(err.Error(), "404") && !strings.Contains(err.Error(), "not found") {
+		t.Errorf("Expected 404/not found error, got: %v", err)
+	}
+}
+
+// TestListIssues_Empty tests listing when no issues exist
+func TestListIssues_Empty(t *testing.T) {
+	mockGH := NewMockServer()
+	defer mockGH.Close()
+
+	client := NewWithBaseURL("test-token", mockGH.URL)
+
+	issues, err := client.ListIssues("owner", "repo")
+	if err != nil {
+		t.Fatalf("ListIssues() unexpected error: %v", err)
+	}
+
+	if len(issues) != 0 {
+		t.Errorf("Expected 0 issues, got %d", len(issues))
+	}
+}
+
+// =============================================================================
+// Integration Tests (require real GitHub token)
+// =============================================================================
 
 func TestGetToken(t *testing.T) {
 	token, err := GetToken()
@@ -25,7 +496,7 @@ func TestGetToken(t *testing.T) {
 	t.Logf("Token retrieved successfully (prefix: %s...)", token[:10])
 }
 
-func TestListIssues(t *testing.T) {
+func TestListIssues_Integration(t *testing.T) {
 	token, err := GetToken()
 	if err != nil {
 		t.Skipf("Skipping: no GitHub token available (%v)", err)
@@ -47,7 +518,7 @@ func TestListIssues(t *testing.T) {
 	}
 }
 
-func TestGetIssue(t *testing.T) {
+func TestGetIssue_Integration(t *testing.T) {
 	token, err := GetToken()
 	if err != nil {
 		t.Skipf("Skipping: no GitHub token available (%v)", err)
@@ -81,24 +552,7 @@ func TestGetIssue(t *testing.T) {
 	t.Logf("  Body preview: %s...", truncate(issue.Body, 100))
 }
 
-func TestUpdateIssueCompiles(t *testing.T) {
-	// This test verifies UpdateIssue compiles and can be called
-	// We don't actually call it to avoid modifying the test issue
-
-	token, err := GetToken()
-	if err != nil {
-		t.Skipf("Skipping: no GitHub token available (%v)", err)
-	}
-
-	client := New(token)
-
-	// Just verify the method exists and has the right signature
-	var _ func(string, string, int, string) error = client.UpdateIssue
-
-	t.Log("UpdateIssue() compiles correctly")
-}
-
-func TestListComments(t *testing.T) {
+func TestListComments_Integration(t *testing.T) {
 	token, err := GetToken()
 	if err != nil {
 		t.Skipf("Skipping: no GitHub token available (%v)", err)
@@ -127,7 +581,7 @@ func truncate(s string, max int) string {
 // TestMain can be used to run tests manually with verbose output
 func TestMain(m *testing.M) {
 	fmt.Println("Running GitHub API client tests...")
-	fmt.Println("Note: These tests require valid GitHub authentication.")
+	fmt.Println("Note: Integration tests require valid GitHub authentication.")
 	fmt.Println()
 	os.Exit(m.Run())
 }

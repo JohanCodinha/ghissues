@@ -254,6 +254,99 @@ else
 fi
 
 echo ""
+echo "=== Step 8.1: Test partial file reads (head/tail) ==="
+echo "Testing head -20:"
+head -20 "$MOUNTPOINT/$ISSUE_FILE"
+LINE_COUNT=$(wc -l < "$MOUNTPOINT/$ISSUE_FILE")
+echo "Total lines: $LINE_COUNT"
+if [ "$LINE_COUNT" -lt 5 ]; then
+    echo "ERROR: File too short"
+    kill $MOUNT_PID 2>/dev/null || true
+    exit 1
+fi
+echo "✓ Partial read works"
+
+echo ""
+echo "=== Step 8.2: Test grep search across directory ==="
+# Use the marker we know exists in the file
+MARKER="E2E_TEST_MARKER"
+GREP_RESULT=$(grep -l "$MARKER" "$MOUNTPOINT"/*.md 2>/dev/null | wc -l)
+if [ "$GREP_RESULT" -lt 1 ]; then
+    echo "ERROR: grep -l failed"
+    kill $MOUNT_PID 2>/dev/null || true
+    exit 1
+fi
+echo "✓ grep search works"
+
+echo ""
+echo "=== Step 8.3: Test find command ==="
+FIND_COUNT=$(find "$MOUNTPOINT" -name "*.md" | wc -l)
+if [ "$FIND_COUNT" -lt 1 ]; then
+    echo "ERROR: find found no files"
+    kill $MOUNT_PID 2>/dev/null || true
+    exit 1
+fi
+echo "✓ find command works"
+
+echo ""
+echo "=== Step 8.4: Test stat command ==="
+# Use portable stat (macOS vs Linux syntax differs)
+if stat --version 2>/dev/null | grep -q GNU; then
+    FILE_SIZE=$(stat --format=%s "$MOUNTPOINT/$ISSUE_FILE")
+else
+    FILE_SIZE=$(stat -f%z "$MOUNTPOINT/$ISSUE_FILE")
+fi
+if [ "$FILE_SIZE" -lt 100 ]; then
+    echo "ERROR: File too small: $FILE_SIZE bytes"
+    kill $MOUNT_PID 2>/dev/null || true
+    exit 1
+fi
+echo "✓ stat works (size: $FILE_SIZE bytes)"
+
+echo ""
+echo "=== Step 8.5: Test wc command ==="
+WC_OUTPUT=$(wc "$MOUNTPOINT/$ISSUE_FILE")
+echo "wc output: $WC_OUTPUT"
+echo "✓ wc works"
+
+echo ""
+echo "=== Step 8.6: Test file type detection ==="
+FILE_TYPE=$(file "$MOUNTPOINT/$ISSUE_FILE")
+if ! echo "$FILE_TYPE" | grep -qi "text"; then
+    echo "WARNING: File not detected as text"
+fi
+echo "✓ file type: $FILE_TYPE"
+
+echo ""
+echo "=== Step 8.7: Test unsupported operations fail gracefully ==="
+echo "Testing unsupported operations..."
+
+# touch (create new file) - should fail
+if touch "$MOUNTPOINT/new-file.md" 2>/dev/null; then
+    echo "WARNING: touch succeeded unexpectedly"
+    rm -f "$MOUNTPOINT/new-file.md" 2>/dev/null
+else
+    echo "✓ touch correctly rejected"
+fi
+
+# rm (delete) - should fail
+if rm "$MOUNTPOINT/$ISSUE_FILE" 2>/dev/null; then
+    echo "ERROR: rm succeeded - this is dangerous!"
+    kill $MOUNT_PID 2>/dev/null || true
+    exit 1
+else
+    echo "✓ rm correctly rejected"
+fi
+
+# mv (rename) - should fail
+if mv "$MOUNTPOINT/$ISSUE_FILE" "$MOUNTPOINT/renamed.md" 2>/dev/null; then
+    echo "WARNING: mv succeeded unexpectedly"
+    mv "$MOUNTPOINT/renamed.md" "$MOUNTPOINT/$ISSUE_FILE" 2>/dev/null
+else
+    echo "✓ mv correctly rejected"
+fi
+
+echo ""
 echo "=== Step 9: Cleanup mount ==="
 # Unmount gracefully
 kill -INT $MOUNT_PID 2>/dev/null || true

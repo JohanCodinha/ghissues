@@ -2,6 +2,7 @@ package gh
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -16,6 +17,14 @@ type MockServer struct {
 	mu       sync.RWMutex
 	issues   map[int]*Issue              // issue number -> issue
 	comments map[int][]*Comment          // issue number -> comments
+
+	// Pagination settings
+	issuesPerPage   int // 0 means return all in one page
+	commentsPerPage int // 0 means return all in one page
+
+	// Error simulation
+	forceStatusCode int    // If set, return this status code for next request
+	forceErrorBody  string // Error body to return with forceStatusCode
 }
 
 // NewMockServer creates a mock GitHub API server
@@ -115,17 +124,99 @@ func (m *MockServer) GetComments(issueNumber int) []*Comment {
 	return m.comments[issueNumber]
 }
 
+// SetIssuesPerPage sets pagination for issues (0 = no pagination)
+func (m *MockServer) SetIssuesPerPage(perPage int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.issuesPerPage = perPage
+}
+
+// SetCommentsPerPage sets pagination for comments (0 = no pagination)
+func (m *MockServer) SetCommentsPerPage(perPage int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.commentsPerPage = perPage
+}
+
+// SetNextError sets an error to be returned for the next request
+func (m *MockServer) SetNextError(statusCode int, body string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.forceStatusCode = statusCode
+	m.forceErrorBody = body
+}
+
+// clearError clears any forced error (internal use)
+func (m *MockServer) clearError() (int, string) {
+	code := m.forceStatusCode
+	body := m.forceErrorBody
+	m.forceStatusCode = 0
+	m.forceErrorBody = ""
+	return code, body
+}
+
 func (m *MockServer) handleListIssues(w http.ResponseWriter, r *http.Request) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	m.mu.Lock()
+	// Check for forced error
+	if code, body := m.clearError(); code != 0 {
+		m.mu.Unlock()
+		http.Error(w, body, code)
+		return
+	}
 
 	issues := make([]*Issue, 0, len(m.issues))
 	for _, issue := range m.issues {
 		issues = append(issues, issue)
 	}
+	perPage := m.issuesPerPage
+	m.mu.Unlock()
+
+	// Sort issues by number for consistent pagination
+	sortIssuesByNumber(issues)
+
+	// Handle pagination
+	if perPage > 0 {
+		page := 1
+		if p := r.URL.Query().Get("page"); p != "" {
+			page, _ = strconv.Atoi(p)
+			if page < 1 {
+				page = 1
+			}
+		}
+
+		start := (page - 1) * perPage
+		end := start + perPage
+
+		if start >= len(issues) {
+			issues = []*Issue{}
+		} else {
+			if end > len(issues) {
+				end = len(issues)
+			}
+			issues = issues[start:end]
+
+			// Add Link header for next page if there are more
+			totalPages := (len(m.issues) + perPage - 1) / perPage
+			if page < totalPages {
+				nextURL := fmt.Sprintf("%s%s?page=%d", m.Server.URL, r.URL.Path, page+1)
+				w.Header().Set("Link", fmt.Sprintf(`<%s>; rel="next"`, nextURL))
+			}
+		}
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(issues)
+}
+
+// sortIssuesByNumber sorts issues by their number (ascending)
+func sortIssuesByNumber(issues []*Issue) {
+	for i := 0; i < len(issues)-1; i++ {
+		for j := i + 1; j < len(issues); j++ {
+			if issues[i].Number > issues[j].Number {
+				issues[i], issues[j] = issues[j], issues[i]
+			}
+		}
+	}
 }
 
 func (m *MockServer) handleGetIssue(w http.ResponseWriter, r *http.Request, number int) {
@@ -151,11 +242,19 @@ func (m *MockServer) handleGetIssue(w http.ResponseWriter, r *http.Request, numb
 
 func (m *MockServer) handleUpdateIssue(w http.ResponseWriter, r *http.Request, number int) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	// Check for forced error first
+	if code, body := m.clearError(); code != 0 {
+		m.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(code)
+		w.Write([]byte(body))
+		return
+	}
 
 	issue, ok := m.issues[number]
 	if !ok {
-		http.Error(w, "not found", http.StatusNotFound)
+		m.mu.Unlock()
+		http.Error(w, `{"message":"Not Found"}`, http.StatusNotFound)
 		return
 	}
 
@@ -164,6 +263,7 @@ func (m *MockServer) handleUpdateIssue(w http.ResponseWriter, r *http.Request, n
 		Body  string `json:"body,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
+		m.mu.Unlock()
 		http.Error(w, "invalid json", http.StatusBadRequest)
 		return
 	}
@@ -176,18 +276,57 @@ func (m *MockServer) handleUpdateIssue(w http.ResponseWriter, r *http.Request, n
 	}
 	issue.UpdatedAt = time.Now().UTC()
 	issue.ETag = `"` + strconv.FormatInt(time.Now().UnixNano(), 16) + `"`
+	m.mu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(issue)
 }
 
 func (m *MockServer) handleListComments(w http.ResponseWriter, r *http.Request, number int) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	m.mu.Lock()
+	// Check for forced error
+	if code, body := m.clearError(); code != 0 {
+		m.mu.Unlock()
+		http.Error(w, body, code)
+		return
+	}
 
 	comments := m.comments[number]
 	if comments == nil {
 		comments = []*Comment{}
+	}
+	perPage := m.commentsPerPage
+	totalComments := len(comments)
+	m.mu.Unlock()
+
+	// Handle pagination
+	if perPage > 0 && len(comments) > 0 {
+		page := 1
+		if p := r.URL.Query().Get("page"); p != "" {
+			page, _ = strconv.Atoi(p)
+			if page < 1 {
+				page = 1
+			}
+		}
+
+		start := (page - 1) * perPage
+		end := start + perPage
+
+		if start >= len(comments) {
+			comments = []*Comment{}
+		} else {
+			if end > len(comments) {
+				end = len(comments)
+			}
+			comments = comments[start:end]
+
+			// Add Link header for next page if there are more
+			totalPages := (totalComments + perPage - 1) / perPage
+			if page < totalPages {
+				nextURL := fmt.Sprintf("%s%s?page=%d", m.Server.URL, r.URL.Path, page+1)
+				w.Header().Set("Link", fmt.Sprintf(`<%s>; rel="next"`, nextURL))
+			}
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")

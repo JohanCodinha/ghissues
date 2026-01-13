@@ -16,6 +16,67 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// validateRepo validates the repository format and returns the owner and repo name.
+// The format must be "owner/repo" where neither owner nor repo is empty.
+func validateRepo(repo string) (owner, name string, err error) {
+	if !strings.Contains(repo, "/") {
+		return "", "", fmt.Errorf("invalid repository format %q: must be in the format owner/repo", repo)
+	}
+
+	parts := strings.SplitN(repo, "/", 2)
+	if parts[0] == "" || parts[1] == "" {
+		return "", "", fmt.Errorf("invalid repository format %q: owner and repo cannot be empty", repo)
+	}
+
+	return parts[0], parts[1], nil
+}
+
+// ensureMountpoint ensures that the mountpoint exists and is a directory.
+// If the mountpoint doesn't exist, it will be created.
+// Returns true if the mountpoint was created, false if it already existed.
+func ensureMountpoint(path string) (created bool, err error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			if err := os.MkdirAll(path, 0755); err != nil {
+				return false, fmt.Errorf("failed to create mountpoint %q: %w", path, err)
+			}
+			return true, nil
+		}
+		return false, fmt.Errorf("cannot access mountpoint %q: %w", path, err)
+	}
+
+	if !info.IsDir() {
+		return false, fmt.Errorf("mountpoint %q is not a directory", path)
+	}
+
+	return false, nil
+}
+
+// getCachePath returns the path to the cache database file for the given repository.
+// The cache is stored at ~/.cache/ghissues/{owner}_{repo}.db
+func getCachePath(owner, repoName string) (string, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("failed to get home directory: %w", err)
+	}
+
+	cacheDir := filepath.Join(homeDir, ".cache", "ghissues")
+	if err := os.MkdirAll(cacheDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create cache directory: %w", err)
+	}
+
+	return filepath.Join(cacheDir, fmt.Sprintf("%s_%s.db", owner, repoName)), nil
+}
+
+// getUnmountCommand returns the appropriate system unmount command for the current OS.
+func getUnmountCommand(mountpoint string) *exec.Cmd {
+	if runtime.GOOS == "darwin" {
+		return exec.Command("umount", mountpoint)
+	}
+	return exec.Command("fusermount", "-u", mountpoint)
+}
+
 func main() {
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -60,29 +121,19 @@ func runMount(cmd *cobra.Command, args []string) error {
 	repo := args[0]
 	mountpoint := args[1]
 
-	// Validate repo format contains "/"
-	if !strings.Contains(repo, "/") {
-		return fmt.Errorf("invalid repository format %q: must be in the format owner/repo", repo)
-	}
-
-	parts := strings.SplitN(repo, "/", 2)
-	if parts[0] == "" || parts[1] == "" {
-		return fmt.Errorf("invalid repository format %q: owner and repo cannot be empty", repo)
+	// Validate repo format
+	owner, repoName, err := validateRepo(repo)
+	if err != nil {
+		return err
 	}
 
 	// Create mountpoint if it doesn't exist
-	info, err := os.Stat(mountpoint)
+	created, err := ensureMountpoint(mountpoint)
 	if err != nil {
-		if os.IsNotExist(err) {
-			if err := os.MkdirAll(mountpoint, 0755); err != nil {
-				return fmt.Errorf("failed to create mountpoint %q: %w", mountpoint, err)
-			}
-			fmt.Printf("created mountpoint %s\n", mountpoint)
-		} else {
-			return fmt.Errorf("cannot access mountpoint %q: %w", mountpoint, err)
-		}
-	} else if !info.IsDir() {
-		return fmt.Errorf("mountpoint %q is not a directory", mountpoint)
+		return err
+	}
+	if created {
+		fmt.Printf("created mountpoint %s\n", mountpoint)
 	}
 
 	// 1. Get GitHub auth token
@@ -96,15 +147,10 @@ func runMount(cmd *cobra.Command, args []string) error {
 	client := gh.New(token)
 
 	// 3. Determine cache path: ~/.cache/ghissues/{owner}_{repo}.db
-	homeDir, err := os.UserHomeDir()
+	cachePath, err := getCachePath(owner, repoName)
 	if err != nil {
-		return fmt.Errorf("failed to get home directory: %w", err)
+		return err
 	}
-	cacheDir := filepath.Join(homeDir, ".cache", "ghissues")
-	if err := os.MkdirAll(cacheDir, 0755); err != nil {
-		return fmt.Errorf("failed to create cache directory: %w", err)
-	}
-	cachePath := filepath.Join(cacheDir, fmt.Sprintf("%s_%s.db", parts[0], parts[1]))
 
 	// 4. Initialize cache
 	cacheDB, err := cache.InitDB(cachePath)
@@ -187,19 +233,11 @@ func runUnmount(cmd *cobra.Command, args []string) error {
 	fmt.Printf("unmounting %s\n", absMountpoint)
 
 	// Call the appropriate system unmount command based on platform
-	var unmountCmd *exec.Cmd
-	if runtime.GOOS == "darwin" {
-		// macOS uses umount
-		unmountCmd = exec.Command("umount", absMountpoint)
-	} else {
-		// Linux uses fusermount -u
-		unmountCmd = exec.Command("fusermount", "-u", absMountpoint)
-	}
+	unmountCommand := getUnmountCommand(absMountpoint)
+	unmountCommand.Stdout = os.Stdout
+	unmountCommand.Stderr = os.Stderr
 
-	unmountCmd.Stdout = os.Stdout
-	unmountCmd.Stderr = os.Stderr
-
-	if err := unmountCmd.Run(); err != nil {
+	if err := unmountCommand.Run(); err != nil {
 		return fmt.Errorf("failed to unmount: %w", err)
 	}
 

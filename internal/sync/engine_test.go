@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/JohanCodinha/ghissues/internal/cache"
+	"github.com/JohanCodinha/ghissues/internal/gh"
 )
 
 func TestParseRepo(t *testing.T) {
@@ -409,4 +410,681 @@ func TestTempDirCleanup(t *testing.T) {
 	}
 
 	// t.TempDir() will clean up automatically after test
+}
+
+// ============================================================================
+// Integration tests with mock server
+// ============================================================================
+
+// setupTestEngine creates a test engine with mock server
+func setupTestEngine(t *testing.T) (*Engine, *cache.DB, *gh.MockServer) {
+	t.Helper()
+
+	tmpDir := t.TempDir()
+	cachePath := filepath.Join(tmpDir, "test.db")
+	cacheDB, err := cache.InitDB(cachePath)
+	if err != nil {
+		t.Fatalf("failed to init db: %v", err)
+	}
+
+	mockGH := gh.NewMockServer()
+
+	client := gh.NewWithBaseURL("test-token", mockGH.URL)
+	engine, err := NewEngine(cacheDB, client, "owner/repo", 100)
+	if err != nil {
+		cacheDB.Close()
+		mockGH.Close()
+		t.Fatalf("failed to create engine: %v", err)
+	}
+
+	return engine, cacheDB, mockGH
+}
+
+// TestInitialSync_MultipleIssues tests successful sync with multiple issues
+func TestInitialSync_MultipleIssues(t *testing.T) {
+	engine, cacheDB, mockGH := setupTestEngine(t)
+	defer engine.Stop()
+	defer cacheDB.Close()
+	defer mockGH.Close()
+
+	baseTime := time.Date(2026, 1, 13, 10, 0, 0, 0, time.UTC)
+
+	// Add issues to mock server
+	mockGH.AddIssue(&gh.Issue{
+		Number:    1,
+		Title:     "Issue 1",
+		Body:      "Body 1",
+		State:     "open",
+		User:      gh.User{Login: "user1"},
+		Labels:    []gh.Label{{Name: "bug", Color: "d73a4a"}},
+		CreatedAt: baseTime,
+		UpdatedAt: baseTime,
+		ETag:      `"etag1"`,
+	})
+	mockGH.AddIssue(&gh.Issue{
+		Number:    2,
+		Title:     "Issue 2",
+		Body:      "Body 2",
+		State:     "closed",
+		User:      gh.User{Login: "user2"},
+		Labels:    []gh.Label{{Name: "enhancement", Color: "a2eeef"}},
+		CreatedAt: baseTime.Add(1 * time.Hour),
+		UpdatedAt: baseTime.Add(2 * time.Hour),
+		ETag:      `"etag2"`,
+	})
+	mockGH.AddIssue(&gh.Issue{
+		Number:    3,
+		Title:     "Issue 3",
+		Body:      "Body 3",
+		State:     "open",
+		User:      gh.User{Login: "user3"},
+		Labels:    []gh.Label{},
+		CreatedAt: baseTime.Add(2 * time.Hour),
+		UpdatedAt: baseTime.Add(3 * time.Hour),
+		ETag:      `"etag3"`,
+	})
+
+	// Add comments for issue 1
+	mockGH.AddComment(1, &gh.Comment{
+		ID:        101,
+		User:      gh.User{Login: "commenter1"},
+		Body:      "Comment on issue 1",
+		CreatedAt: baseTime.Add(30 * time.Minute),
+		UpdatedAt: baseTime.Add(30 * time.Minute),
+	})
+
+	// Perform initial sync
+	err := engine.InitialSync()
+	if err != nil {
+		t.Fatalf("InitialSync() error = %v", err)
+	}
+
+	// Verify issues are cached
+	issues, err := cacheDB.ListIssues("owner/repo")
+	if err != nil {
+		t.Fatalf("failed to list cached issues: %v", err)
+	}
+
+	if len(issues) != 3 {
+		t.Errorf("expected 3 cached issues, got %d", len(issues))
+	}
+
+	// Verify specific issue data
+	issue1, err := cacheDB.GetIssue("owner/repo", 1)
+	if err != nil {
+		t.Fatalf("failed to get issue 1: %v", err)
+	}
+	if issue1 == nil {
+		t.Fatal("issue 1 not found in cache")
+	}
+	if issue1.Title != "Issue 1" {
+		t.Errorf("issue 1 title = %q, want %q", issue1.Title, "Issue 1")
+	}
+	if issue1.Body != "Body 1" {
+		t.Errorf("issue 1 body = %q, want %q", issue1.Body, "Body 1")
+	}
+	if issue1.State != "open" {
+		t.Errorf("issue 1 state = %q, want %q", issue1.State, "open")
+	}
+	if issue1.Author != "user1" {
+		t.Errorf("issue 1 author = %q, want %q", issue1.Author, "user1")
+	}
+	if len(issue1.Labels) != 1 || issue1.Labels[0] != "bug" {
+		t.Errorf("issue 1 labels = %v, want [bug]", issue1.Labels)
+	}
+	if issue1.Dirty {
+		t.Error("issue 1 should not be dirty after initial sync")
+	}
+
+	// Verify comments are fetched
+	comments, err := cacheDB.GetComments("owner/repo", 1)
+	if err != nil {
+		t.Fatalf("failed to get comments: %v", err)
+	}
+	if len(comments) != 1 {
+		t.Errorf("expected 1 comment for issue 1, got %d", len(comments))
+	}
+	if len(comments) > 0 && comments[0].Body != "Comment on issue 1" {
+		t.Errorf("comment body = %q, want %q", comments[0].Body, "Comment on issue 1")
+	}
+}
+
+// TestInitialSync_EmptyRepository tests sync with no issues
+func TestInitialSync_EmptyRepository(t *testing.T) {
+	engine, cacheDB, mockGH := setupTestEngine(t)
+	defer engine.Stop()
+	defer cacheDB.Close()
+	defer mockGH.Close()
+
+	// Don't add any issues to mock server
+
+	// Perform initial sync
+	err := engine.InitialSync()
+	if err != nil {
+		t.Fatalf("InitialSync() error = %v", err)
+	}
+
+	// Verify no issues are cached
+	issues, err := cacheDB.ListIssues("owner/repo")
+	if err != nil {
+		t.Fatalf("failed to list cached issues: %v", err)
+	}
+
+	if len(issues) != 0 {
+		t.Errorf("expected 0 cached issues for empty repo, got %d", len(issues))
+	}
+}
+
+// TestSyncIssue_ConflictResolution tests conflict detection during sync
+func TestSyncIssue_ConflictResolution(t *testing.T) {
+	baseTime := time.Date(2026, 1, 13, 10, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name              string
+		localUpdatedAt    time.Time
+		remoteUpdatedAt   time.Time
+		expectPush        bool // true = local wins and pushes, false = conflict (remote newer)
+		expectDirtyAfter  bool // true = issue stays dirty, false = dirty cleared
+	}{
+		{
+			name:             "local newer than remote - should push",
+			localUpdatedAt:   baseTime.Add(2 * time.Hour),
+			remoteUpdatedAt:  baseTime.Add(1 * time.Hour),
+			expectPush:       true,
+			expectDirtyAfter: false,
+		},
+		{
+			name:             "remote newer than local - conflict, skip push",
+			localUpdatedAt:   baseTime.Add(1 * time.Hour),
+			remoteUpdatedAt:  baseTime.Add(2 * time.Hour),
+			expectPush:       false,
+			expectDirtyAfter: true, // Issue stays dirty due to conflict
+		},
+		{
+			name:             "same timestamp - local wins",
+			localUpdatedAt:   baseTime,
+			remoteUpdatedAt:  baseTime,
+			expectPush:       true,
+			expectDirtyAfter: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			engine, cacheDB, mockGH := setupTestEngine(t)
+			defer engine.Stop()
+			defer cacheDB.Close()
+			defer mockGH.Close()
+
+			// Add issue to mock server with remote timestamp
+			mockGH.AddIssue(&gh.Issue{
+				Number:    1,
+				Title:     "Test Issue",
+				Body:      "Original body",
+				State:     "open",
+				User:      gh.User{Login: "user1"},
+				Labels:    []gh.Label{},
+				CreatedAt: baseTime,
+				UpdatedAt: tt.remoteUpdatedAt,
+				ETag:      `"etag1"`,
+			})
+
+			// Insert issue into cache
+			cacheIssue := cache.Issue{
+				Number:         1,
+				Repo:           "owner/repo",
+				Title:          "Test Issue",
+				Body:           "Modified body",
+				State:          "open",
+				Author:         "user1",
+				Labels:         []string{},
+				CreatedAt:      baseTime.Format(time.RFC3339),
+				UpdatedAt:      baseTime.Format(time.RFC3339),
+				ETag:           `"etag1"`,
+				Dirty:          true,
+				LocalUpdatedAt: tt.localUpdatedAt.Format(time.RFC3339),
+			}
+			if err := cacheDB.UpsertIssue(cacheIssue); err != nil {
+				t.Fatalf("failed to upsert issue: %v", err)
+			}
+
+			// Trigger sync
+			err := engine.SyncNow()
+			if err != nil {
+				// Errors are aggregated but shouldn't fail for conflict scenarios
+				t.Logf("SyncNow returned error (may be expected): %v", err)
+			}
+
+			// Check if issue was pushed (body changed on mock server)
+			remoteIssue := mockGH.GetIssue(1)
+			if remoteIssue == nil {
+				t.Fatal("remote issue not found")
+			}
+
+			if tt.expectPush {
+				if remoteIssue.Body != "Modified body" {
+					t.Errorf("expected push to update body to %q, got %q", "Modified body", remoteIssue.Body)
+				}
+			} else {
+				if remoteIssue.Body != "Original body" {
+					t.Errorf("expected conflict to skip push, but body changed to %q", remoteIssue.Body)
+				}
+			}
+
+			// Check dirty status
+			cachedIssue, err := cacheDB.GetIssue("owner/repo", 1)
+			if err != nil {
+				t.Fatalf("failed to get cached issue: %v", err)
+			}
+			if cachedIssue.Dirty != tt.expectDirtyAfter {
+				t.Errorf("expected dirty=%v after sync, got %v", tt.expectDirtyAfter, cachedIssue.Dirty)
+			}
+		})
+	}
+}
+
+// TestRefreshIssue_NotModified tests 304 response handling
+func TestRefreshIssue_NotModified(t *testing.T) {
+	engine, cacheDB, mockGH := setupTestEngine(t)
+	defer engine.Stop()
+	defer cacheDB.Close()
+	defer mockGH.Close()
+
+	baseTime := time.Date(2026, 1, 13, 10, 0, 0, 0, time.UTC)
+	etag := `"etag123"`
+
+	// Add issue to mock server
+	mockGH.AddIssue(&gh.Issue{
+		Number:    1,
+		Title:     "Test Issue",
+		Body:      "Original body",
+		State:     "open",
+		User:      gh.User{Login: "user1"},
+		Labels:    []gh.Label{},
+		CreatedAt: baseTime,
+		UpdatedAt: baseTime,
+		ETag:      etag,
+	})
+
+	// Insert issue into cache with same etag
+	cacheIssue := cache.Issue{
+		Number:    1,
+		Repo:      "owner/repo",
+		Title:     "Test Issue",
+		Body:      "Original body",
+		State:     "open",
+		Author:    "user1",
+		Labels:    []string{},
+		CreatedAt: baseTime.Format(time.RFC3339),
+		UpdatedAt: baseTime.Format(time.RFC3339),
+		ETag:      etag,
+		Dirty:     false,
+	}
+	if err := cacheDB.UpsertIssue(cacheIssue); err != nil {
+		t.Fatalf("failed to upsert issue: %v", err)
+	}
+
+	// Refresh issue - should get 304
+	updated, err := engine.RefreshIssue(1)
+	if err != nil {
+		t.Fatalf("RefreshIssue() error = %v", err)
+	}
+
+	if updated {
+		t.Error("expected updated=false for 304 Not Modified")
+	}
+
+	// Verify cache unchanged
+	cachedIssue, err := cacheDB.GetIssue("owner/repo", 1)
+	if err != nil {
+		t.Fatalf("failed to get cached issue: %v", err)
+	}
+	if cachedIssue.Body != "Original body" {
+		t.Errorf("body should be unchanged, got %q", cachedIssue.Body)
+	}
+}
+
+// TestRefreshIssue_WithChanges tests 200 response with updated data
+func TestRefreshIssue_WithChanges(t *testing.T) {
+	engine, cacheDB, mockGH := setupTestEngine(t)
+	defer engine.Stop()
+	defer cacheDB.Close()
+	defer mockGH.Close()
+
+	baseTime := time.Date(2026, 1, 13, 10, 0, 0, 0, time.UTC)
+	oldEtag := `"etag-old"`
+	newEtag := `"etag-new"`
+
+	// Add issue to mock server with new etag
+	mockGH.AddIssue(&gh.Issue{
+		Number:    1,
+		Title:     "Updated Title",
+		Body:      "Updated body",
+		State:     "closed",
+		User:      gh.User{Login: "user1"},
+		Labels:    []gh.Label{{Name: "fixed", Color: "00ff00"}},
+		CreatedAt: baseTime,
+		UpdatedAt: baseTime.Add(1 * time.Hour),
+		ETag:      newEtag,
+	})
+
+	// Insert issue into cache with old etag
+	cacheIssue := cache.Issue{
+		Number:    1,
+		Repo:      "owner/repo",
+		Title:     "Old Title",
+		Body:      "Old body",
+		State:     "open",
+		Author:    "user1",
+		Labels:    []string{"bug"},
+		CreatedAt: baseTime.Format(time.RFC3339),
+		UpdatedAt: baseTime.Format(time.RFC3339),
+		ETag:      oldEtag,
+		Dirty:     false,
+	}
+	if err := cacheDB.UpsertIssue(cacheIssue); err != nil {
+		t.Fatalf("failed to upsert issue: %v", err)
+	}
+
+	// Refresh issue - should get 200 with new data
+	updated, err := engine.RefreshIssue(1)
+	if err != nil {
+		t.Fatalf("RefreshIssue() error = %v", err)
+	}
+
+	if !updated {
+		t.Error("expected updated=true for 200 with new data")
+	}
+
+	// Verify cache updated
+	cachedIssue, err := cacheDB.GetIssue("owner/repo", 1)
+	if err != nil {
+		t.Fatalf("failed to get cached issue: %v", err)
+	}
+	if cachedIssue.Title != "Updated Title" {
+		t.Errorf("title = %q, want %q", cachedIssue.Title, "Updated Title")
+	}
+	if cachedIssue.Body != "Updated body" {
+		t.Errorf("body = %q, want %q", cachedIssue.Body, "Updated body")
+	}
+	if cachedIssue.State != "closed" {
+		t.Errorf("state = %q, want %q", cachedIssue.State, "closed")
+	}
+	if cachedIssue.ETag != newEtag {
+		t.Errorf("etag = %q, want %q", cachedIssue.ETag, newEtag)
+	}
+	if len(cachedIssue.Labels) != 1 || cachedIssue.Labels[0] != "fixed" {
+		t.Errorf("labels = %v, want [fixed]", cachedIssue.Labels)
+	}
+}
+
+// TestRefreshIssue_DirtySkipped tests that dirty issues are not refreshed
+func TestRefreshIssue_DirtySkipped(t *testing.T) {
+	engine, cacheDB, mockGH := setupTestEngine(t)
+	defer engine.Stop()
+	defer cacheDB.Close()
+	defer mockGH.Close()
+
+	baseTime := time.Date(2026, 1, 13, 10, 0, 0, 0, time.UTC)
+
+	// Add issue to mock server with updated data
+	mockGH.AddIssue(&gh.Issue{
+		Number:    1,
+		Title:     "Updated Title",
+		Body:      "Updated body from remote",
+		State:     "open",
+		User:      gh.User{Login: "user1"},
+		Labels:    []gh.Label{},
+		CreatedAt: baseTime,
+		UpdatedAt: baseTime.Add(1 * time.Hour),
+		ETag:      `"new-etag"`,
+	})
+
+	// Insert dirty issue into cache
+	cacheIssue := cache.Issue{
+		Number:         1,
+		Repo:           "owner/repo",
+		Title:          "Local Title",
+		Body:           "Local modified body",
+		State:          "open",
+		Author:         "user1",
+		Labels:         []string{},
+		CreatedAt:      baseTime.Format(time.RFC3339),
+		UpdatedAt:      baseTime.Format(time.RFC3339),
+		ETag:           `"old-etag"`,
+		Dirty:          true,
+		LocalUpdatedAt: baseTime.Add(30 * time.Minute).Format(time.RFC3339),
+	}
+	if err := cacheDB.UpsertIssue(cacheIssue); err != nil {
+		t.Fatalf("failed to upsert issue: %v", err)
+	}
+
+	// Refresh issue - should skip because dirty
+	updated, err := engine.RefreshIssue(1)
+	if err != nil {
+		t.Fatalf("RefreshIssue() error = %v", err)
+	}
+
+	if updated {
+		t.Error("expected updated=false for dirty issue")
+	}
+
+	// Verify cache unchanged (local data preserved)
+	cachedIssue, err := cacheDB.GetIssue("owner/repo", 1)
+	if err != nil {
+		t.Fatalf("failed to get cached issue: %v", err)
+	}
+	if cachedIssue.Body != "Local modified body" {
+		t.Errorf("body should be unchanged, got %q", cachedIssue.Body)
+	}
+	if !cachedIssue.Dirty {
+		t.Error("issue should still be dirty")
+	}
+}
+
+// TestHasConflict tests conflict detection for various scenarios
+func TestHasConflict(t *testing.T) {
+	baseTime := time.Date(2026, 1, 13, 10, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name            string
+		dirty           bool
+		localUpdatedAt  time.Time
+		remoteUpdatedAt time.Time
+		expectConflict  bool
+	}{
+		{
+			name:            "non-dirty issue - no conflict",
+			dirty:           false,
+			localUpdatedAt:  baseTime,
+			remoteUpdatedAt: baseTime.Add(1 * time.Hour),
+			expectConflict:  false,
+		},
+		{
+			name:            "dirty, local newer - no conflict",
+			dirty:           true,
+			localUpdatedAt:  baseTime.Add(2 * time.Hour),
+			remoteUpdatedAt: baseTime.Add(1 * time.Hour),
+			expectConflict:  false,
+		},
+		{
+			name:            "dirty, remote newer - conflict",
+			dirty:           true,
+			localUpdatedAt:  baseTime.Add(1 * time.Hour),
+			remoteUpdatedAt: baseTime.Add(2 * time.Hour),
+			expectConflict:  true,
+		},
+		{
+			name:            "dirty, same timestamp - no conflict",
+			dirty:           true,
+			localUpdatedAt:  baseTime,
+			remoteUpdatedAt: baseTime,
+			expectConflict:  false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			engine, cacheDB, mockGH := setupTestEngine(t)
+			defer engine.Stop()
+			defer cacheDB.Close()
+			defer mockGH.Close()
+
+			// Add issue to mock server
+			mockGH.AddIssue(&gh.Issue{
+				Number:    1,
+				Title:     "Test Issue",
+				Body:      "Remote body",
+				State:     "open",
+				User:      gh.User{Login: "user1"},
+				Labels:    []gh.Label{},
+				CreatedAt: baseTime,
+				UpdatedAt: tt.remoteUpdatedAt,
+				ETag:      `"etag1"`,
+			})
+
+			// Insert issue into cache
+			localUpdatedAtStr := ""
+			if tt.dirty {
+				localUpdatedAtStr = tt.localUpdatedAt.Format(time.RFC3339)
+			}
+
+			cacheIssue := cache.Issue{
+				Number:         1,
+				Repo:           "owner/repo",
+				Title:          "Test Issue",
+				Body:           "Local body",
+				State:          "open",
+				Author:         "user1",
+				Labels:         []string{},
+				CreatedAt:      baseTime.Format(time.RFC3339),
+				UpdatedAt:      baseTime.Format(time.RFC3339),
+				ETag:           `"etag1"`,
+				Dirty:          tt.dirty,
+				LocalUpdatedAt: localUpdatedAtStr,
+			}
+			if err := cacheDB.UpsertIssue(cacheIssue); err != nil {
+				t.Fatalf("failed to upsert issue: %v", err)
+			}
+
+			// Check for conflict
+			hasConflict, err := engine.HasConflict(1)
+			if err != nil {
+				t.Fatalf("HasConflict() error = %v", err)
+			}
+
+			if hasConflict != tt.expectConflict {
+				t.Errorf("HasConflict() = %v, want %v", hasConflict, tt.expectConflict)
+			}
+		})
+	}
+}
+
+// TestSyncDirtyIssues_PartialFailure tests that sync continues when some issues fail
+func TestSyncDirtyIssues_PartialFailure(t *testing.T) {
+	engine, cacheDB, mockGH := setupTestEngine(t)
+	defer engine.Stop()
+	defer cacheDB.Close()
+	defer mockGH.Close()
+
+	baseTime := time.Date(2026, 1, 13, 10, 0, 0, 0, time.UTC)
+	localTime := baseTime.Add(1 * time.Hour) // Local is newer, should push
+
+	// Add issues 1 and 3 to mock server (issue 2 will be missing, causing failure)
+	mockGH.AddIssue(&gh.Issue{
+		Number:    1,
+		Title:     "Issue 1",
+		Body:      "Original body 1",
+		State:     "open",
+		User:      gh.User{Login: "user1"},
+		Labels:    []gh.Label{},
+		CreatedAt: baseTime,
+		UpdatedAt: baseTime,
+		ETag:      `"etag1"`,
+	})
+	// Issue 2 is NOT added - this will cause a failure when trying to sync
+
+	mockGH.AddIssue(&gh.Issue{
+		Number:    3,
+		Title:     "Issue 3",
+		Body:      "Original body 3",
+		State:     "open",
+		User:      gh.User{Login: "user3"},
+		Labels:    []gh.Label{},
+		CreatedAt: baseTime,
+		UpdatedAt: baseTime,
+		ETag:      `"etag3"`,
+	})
+
+	// Insert 3 dirty issues into cache
+	for i := 1; i <= 3; i++ {
+		cacheIssue := cache.Issue{
+			Number:         i,
+			Repo:           "owner/repo",
+			Title:          "Issue",
+			Body:           "Modified body",
+			State:          "open",
+			Author:         "user",
+			Labels:         []string{},
+			CreatedAt:      baseTime.Format(time.RFC3339),
+			UpdatedAt:      baseTime.Format(time.RFC3339),
+			ETag:           `"etag"`,
+			Dirty:          true,
+			LocalUpdatedAt: localTime.Format(time.RFC3339),
+		}
+		if err := cacheDB.UpsertIssue(cacheIssue); err != nil {
+			t.Fatalf("failed to upsert issue %d: %v", i, err)
+		}
+	}
+
+	// Trigger sync - should report error but continue
+	err := engine.SyncNow()
+	if err == nil {
+		t.Error("expected error due to missing issue 2")
+	}
+
+	// Verify issue 1 was synced (pushed)
+	remoteIssue1 := mockGH.GetIssue(1)
+	if remoteIssue1 == nil {
+		t.Fatal("issue 1 not found on mock server")
+	}
+	if remoteIssue1.Body != "Modified body" {
+		t.Errorf("issue 1 body = %q, want %q", remoteIssue1.Body, "Modified body")
+	}
+
+	// Verify issue 1 is no longer dirty
+	cachedIssue1, err := cacheDB.GetIssue("owner/repo", 1)
+	if err != nil {
+		t.Fatalf("failed to get cached issue 1: %v", err)
+	}
+	if cachedIssue1.Dirty {
+		t.Error("issue 1 should not be dirty after successful sync")
+	}
+
+	// Verify issue 2 is still dirty (sync failed)
+	cachedIssue2, err := cacheDB.GetIssue("owner/repo", 2)
+	if err != nil {
+		t.Fatalf("failed to get cached issue 2: %v", err)
+	}
+	if !cachedIssue2.Dirty {
+		t.Error("issue 2 should still be dirty after failed sync")
+	}
+
+	// Verify issue 3 was synced (pushed)
+	remoteIssue3 := mockGH.GetIssue(3)
+	if remoteIssue3 == nil {
+		t.Fatal("issue 3 not found on mock server")
+	}
+	if remoteIssue3.Body != "Modified body" {
+		t.Errorf("issue 3 body = %q, want %q", remoteIssue3.Body, "Modified body")
+	}
+
+	// Verify issue 3 is no longer dirty
+	cachedIssue3, err := cacheDB.GetIssue("owner/repo", 3)
+	if err != nil {
+		t.Fatalf("failed to get cached issue 3: %v", err)
+	}
+	if cachedIssue3.Dirty {
+		t.Error("issue 3 should not be dirty after successful sync")
+	}
 }

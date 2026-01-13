@@ -85,6 +85,13 @@ func InitDB(path string) (*DB, error) {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
 
+	// Configure connection pool for SQLite.
+	// SQLite only supports a single writer, so we limit to one connection
+	// to prevent "database is locked" errors under concurrent FUSE operations.
+	conn.SetMaxOpenConns(1)
+	conn.SetMaxIdleConns(1)
+	conn.SetConnMaxLifetime(0)
+
 	// Create the issues table if it doesn't exist
 	_, err = conn.Exec(createTableSQL)
 	if err != nil {
