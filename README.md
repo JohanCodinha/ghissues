@@ -86,6 +86,10 @@ author: alice
 created_at: 2026-01-08T09:15:00Z
 updated_at: 2026-01-10T16:03:00Z
 etag: "abc123"
+comments: 2
+parent_issue: 1200
+sub_issues_total: 3
+sub_issues_completed: 1
 ---
 
 # Crash on startup
@@ -93,11 +97,72 @@ etag: "abc123"
 ## Body
 
 Application crashes immediately after login...
+
+## Comments
+
+### 2026-01-10T14:12:00Z - alice
+<!-- comment_id: 987654 -->
+
+I can reproduce this on version 2.3.1
+
+### 2026-01-10T16:03:00Z - bob
+<!-- comment_id: 987655 -->
+
+Looking into it now.
 ```
 
 ### Editing issues
 
 Edit the `## Body` section and save. Changes sync back to GitHub automatically (debounced 500ms after save).
+
+### Editing state and labels
+
+Change `state: open` to `state: closed` in the frontmatter to close an issue. Modify `labels: [bug, enhancement]` to add or remove labels. Changes sync automatically.
+
+### Adding comments
+
+Add a new comment by appending a `### new` section under `## Comments`:
+
+```markdown
+## Comments
+
+### new
+
+My new comment text here.
+```
+
+Save the file and the comment will be created on GitHub.
+
+### Editing comments
+
+Edit the text under any existing comment header (e.g., `### 2026-01-10T14:12:00Z - alice`). The `<!-- comment_id: ... -->` tag identifies which comment to update. Changes sync automatically.
+
+### Creating new issues
+
+Create a new file named `your-title[new].md` with the following structure:
+
+```markdown
+---
+repo: owner/repo
+---
+
+# Your Issue Title
+
+## Body
+
+Your issue description here.
+```
+
+Save the file and a new issue will be created on GitHub. The file will be renamed to include the assigned issue number.
+
+### Sub-issues (parent-child relationships)
+
+Issues can have parent-child relationships. The frontmatter shows:
+- `parent_issue: N` - the parent issue number (if this issue has a parent)
+- `sub_issues_total: N` - total number of sub-issues
+- `sub_issues_completed: N` - number of completed sub-issues
+
+To set or change a parent issue, edit the `parent_issue` field in the frontmatter. To remove a parent, set it to `0` or remove the line.
 
 ## File Format Requirements
 
@@ -109,7 +174,9 @@ ghissues expects a specific markdown structure. Edits that break this structure 
 ---
 id: 1234
 repo: owner/repo
-# ... other frontmatter fields (do not modify)
+state: open
+labels: [bug, enhancement]
+# ... other frontmatter fields
 ---
 
 # Issue Title
@@ -120,19 +187,31 @@ Your issue content here...
 
 ## Comments
 
-(read-only section)
+### 2026-01-10T14:12:00Z - alice
+<!-- comment_id: 987654 -->
+
+Existing comment (editable)
+
+### new
+
+New comment to add
 ```
 
 ### What You Can Safely Edit
 
 - **Title**: Change the `# Title` line
 - **Body**: Edit content under `## Body`
+- **State**: Change `state: open` to `state: closed` (or vice versa)
+- **Labels**: Modify the `labels: [...]` array
+- **Parent issue**: Set or change `parent_issue: N`
+- **Comments**: Edit existing comment bodies or add `### new` sections
 
 ### What Will Cause Errors
 
 - Removing the `---` frontmatter delimiters
-- Modifying frontmatter fields (id, repo, etc.)
+- Modifying read-only frontmatter fields (id, repo, url, author, timestamps, etag)
 - Malformed YAML in frontmatter (unclosed brackets, invalid types)
+- Invalid state values (only `open` or `closed` are valid)
 
 Note: The `# Title` line and `## Body` section are optional for parsing, but removing them will result in empty title/body being saved.
 
@@ -252,8 +331,8 @@ go test ./...
 ## Roadmap
 
 - [x] **Slice 1:** Walking skeleton (mount, read, edit, sync)
-- [ ] **Slice 2:** Comments rendering
-- [ ] **Slice 3:** Edit title, add comments, create issues
+- [x] **Slice 2:** Comments rendering
+- [x] **Slice 3:** Edit title, add comments, create issues, edit state/labels, sub-issues
 - [ ] **Slice 4:** Robust offline mode, rate limiting
 - [ ] **Slice 5:** Pagination, filtering, real-time updates
 
