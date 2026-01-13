@@ -698,9 +698,8 @@ func TestE2E_EmptyIssue(t *testing.T) {
 		content, _ := os.ReadFile(filePath)
 		contentStr := string(content)
 
-		// Find where the body section would be (after frontmatter and title)
-		// Add content after the title
-		newContent := strings.Replace(contentStr, "# Empty Body Issue", "# Empty Body Issue\n\nNew body content added here.", 1)
+		// Add content in the ## Body section (where our parser expects it)
+		newContent := strings.Replace(contentStr, "## Body\n\n", "## Body\n\nNew body content added here.\n\n", 1)
 
 		// Write back
 		if err := os.WriteFile(filePath, []byte(newContent), 0644); err != nil {
