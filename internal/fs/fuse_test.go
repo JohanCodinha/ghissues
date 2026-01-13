@@ -1808,3 +1808,256 @@ func TestSetattr_NoTruncate_ReturnsCorrectMtime(t *testing.T) {
 		t.Errorf("ctime = %v, expected %v", actualCtime, expectedCtime)
 	}
 }
+
+// TestIssueFileNode_Flush_TitleChange tests that Flush marks the cache dirty when title changes.
+func TestIssueFileNode_Flush_TitleChange(t *testing.T) {
+	db, _ := setupTestCache(t)
+	defer db.Close()
+
+	repo := "test/repo"
+	issues := []cache.Issue{
+		{Number: 1, Title: "Original Title", Body: "Original body", State: "open", Author: "testuser"},
+	}
+	populateTestIssues(t, db, repo, issues)
+
+	var onDirtyCalled bool
+	onDirty := func() { onDirtyCalled = true }
+
+	fileNode := &issueFileNode{
+		cache:   db,
+		repo:    repo,
+		number:  1,
+		onDirty: onDirty,
+	}
+
+	ctx := context.Background()
+
+	// Open and modify
+	fh, _, errno := fileNode.Open(ctx, 0)
+	if errno != 0 {
+		t.Fatalf("Open returned error: %v", errno)
+	}
+
+	handle := fh.(*issueFileHandle)
+
+	// Modify only the title in the buffer (leave body unchanged)
+	content := string(handle.buffer)
+	newContent := strings.Replace(content, "# Original Title", "# Updated Title", 1)
+	handle.buffer = []byte(newContent)
+	handle.dirty = true
+
+	// Flush
+	errno = fileNode.Flush(ctx, fh)
+	if errno != 0 {
+		t.Fatalf("Flush returned error: %v", errno)
+	}
+
+	// Verify onDirty callback was called
+	if !onDirtyCalled {
+		t.Error("onDirty callback should have been called for title change")
+	}
+
+	// Verify issue is marked dirty in cache
+	issue, err := db.GetIssue(repo, 1)
+	if err != nil {
+		t.Fatalf("failed to get issue: %v", err)
+	}
+	if !issue.Dirty {
+		t.Error("issue should be marked dirty in cache for title change")
+	}
+	if issue.Title != "Updated Title" {
+		t.Errorf("issue title = %q, expected %q", issue.Title, "Updated Title")
+	}
+	// Body should remain unchanged
+	if issue.Body != "Original body" {
+		t.Errorf("issue body = %q, expected %q (unchanged)", issue.Body, "Original body")
+	}
+}
+
+// TestIssueFileNode_Flush_TitleAndBodyChange tests that Flush handles both title and body changes.
+func TestIssueFileNode_Flush_TitleAndBodyChange(t *testing.T) {
+	db, _ := setupTestCache(t)
+	defer db.Close()
+
+	repo := "test/repo"
+	issues := []cache.Issue{
+		{Number: 1, Title: "Original Title", Body: "Original body", State: "open", Author: "testuser"},
+	}
+	populateTestIssues(t, db, repo, issues)
+
+	var onDirtyCalled bool
+	onDirty := func() { onDirtyCalled = true }
+
+	fileNode := &issueFileNode{
+		cache:   db,
+		repo:    repo,
+		number:  1,
+		onDirty: onDirty,
+	}
+
+	ctx := context.Background()
+
+	// Open and modify
+	fh, _, errno := fileNode.Open(ctx, 0)
+	if errno != 0 {
+		t.Fatalf("Open returned error: %v", errno)
+	}
+
+	handle := fh.(*issueFileHandle)
+
+	// Modify both title and body
+	content := string(handle.buffer)
+	newContent := strings.Replace(content, "# Original Title", "# New Title", 1)
+	newContent = strings.Replace(newContent, "Original body", "New body content", 1)
+	handle.buffer = []byte(newContent)
+	handle.dirty = true
+
+	// Flush
+	errno = fileNode.Flush(ctx, fh)
+	if errno != 0 {
+		t.Fatalf("Flush returned error: %v", errno)
+	}
+
+	// Verify onDirty callback was called
+	if !onDirtyCalled {
+		t.Error("onDirty callback should have been called")
+	}
+
+	// Verify both title and body are updated in cache
+	issue, err := db.GetIssue(repo, 1)
+	if err != nil {
+		t.Fatalf("failed to get issue: %v", err)
+	}
+	if !issue.Dirty {
+		t.Error("issue should be marked dirty in cache")
+	}
+	if issue.Title != "New Title" {
+		t.Errorf("issue title = %q, expected %q", issue.Title, "New Title")
+	}
+	if issue.Body != "New body content" {
+		t.Errorf("issue body = %q, expected %q", issue.Body, "New body content")
+	}
+}
+
+// TestIssueFileNode_Write_ExceedsMaxFileSize tests that writing beyond maxFileSize fails with EFBIG.
+func TestIssueFileNode_Write_ExceedsMaxFileSize(t *testing.T) {
+	db, _ := setupTestCache(t)
+	defer db.Close()
+
+	repo := "test/repo"
+	issues := []cache.Issue{
+		{Number: 1, Title: "Test Issue", Body: "Original body", State: "open"},
+	}
+	populateTestIssues(t, db, repo, issues)
+
+	fileNode := &issueFileNode{
+		cache:  db,
+		repo:   repo,
+		number: 1,
+	}
+
+	ctx := context.Background()
+
+	// Open file
+	fh, _, errno := fileNode.Open(ctx, 0)
+	if errno != 0 {
+		t.Fatalf("Open returned error: %v", errno)
+	}
+
+	// Try to write at an offset that would exceed maxFileSize (10MB)
+	largeOffset := int64(maxFileSize - 100)
+	data := make([]byte, 200) // This would result in end position > maxFileSize
+	for i := range data {
+		data[i] = 'X'
+	}
+
+	written, errno := fileNode.Write(ctx, fh, data, largeOffset)
+	if errno != syscall.EFBIG {
+		t.Errorf("Write beyond maxFileSize should return EFBIG, got errno=%v, written=%d", errno, written)
+	}
+	if written != 0 {
+		t.Errorf("expected 0 bytes written on EFBIG error, got %d", written)
+	}
+}
+
+// TestIssueFileNode_Write_AtMaxFileSize tests writing exactly up to maxFileSize succeeds.
+func TestIssueFileNode_Write_AtMaxFileSize(t *testing.T) {
+	db, _ := setupTestCache(t)
+	defer db.Close()
+
+	repo := "test/repo"
+	issues := []cache.Issue{
+		{Number: 1, Title: "Test", Body: "Short", State: "open"},
+	}
+	populateTestIssues(t, db, repo, issues)
+
+	fileNode := &issueFileNode{
+		cache:  db,
+		repo:   repo,
+		number: 1,
+	}
+
+	ctx := context.Background()
+
+	// Open file
+	fh, _, errno := fileNode.Open(ctx, 0)
+	if errno != 0 {
+		t.Fatalf("Open returned error: %v", errno)
+	}
+
+	// Write at offset that puts end position exactly at maxFileSize
+	offset := int64(maxFileSize - 10)
+	data := make([]byte, 10) // End position = maxFileSize exactly
+	for i := range data {
+		data[i] = 'Y'
+	}
+
+	written, errno := fileNode.Write(ctx, fh, data, offset)
+	if errno != 0 {
+		t.Errorf("Write up to maxFileSize should succeed, got errno=%v", errno)
+	}
+	if int(written) != len(data) {
+		t.Errorf("expected %d bytes written, got %d", len(data), written)
+	}
+}
+
+// TestIssueFileNode_Write_JustOverMaxFileSize tests writing 1 byte over maxFileSize fails.
+func TestIssueFileNode_Write_JustOverMaxFileSize(t *testing.T) {
+	db, _ := setupTestCache(t)
+	defer db.Close()
+
+	repo := "test/repo"
+	issues := []cache.Issue{
+		{Number: 1, Title: "Test", Body: "Short", State: "open"},
+	}
+	populateTestIssues(t, db, repo, issues)
+
+	fileNode := &issueFileNode{
+		cache:  db,
+		repo:   repo,
+		number: 1,
+	}
+
+	ctx := context.Background()
+
+	// Open file
+	fh, _, errno := fileNode.Open(ctx, 0)
+	if errno != 0 {
+		t.Fatalf("Open returned error: %v", errno)
+	}
+
+	// Write that puts end position exactly 1 byte over maxFileSize
+	offset := int64(maxFileSize - 9)
+	data := make([]byte, 10) // End position = maxFileSize + 1
+	for i := range data {
+		data[i] = 'Z'
+	}
+
+	written, errno := fileNode.Write(ctx, fh, data, offset)
+	if errno != syscall.EFBIG {
+		t.Errorf("Write 1 byte over maxFileSize should return EFBIG, got errno=%v", errno)
+	}
+	if written != 0 {
+		t.Errorf("expected 0 bytes written on EFBIG error, got %d", written)
+	}
+}

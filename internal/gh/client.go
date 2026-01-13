@@ -129,6 +129,12 @@ func getTokenFromGhConfig() (string, error) {
 	}
 
 	configPath := filepath.Join(homeDir, ".config", "gh", "hosts.yml")
+	return getTokenFromGhConfigPath(configPath)
+}
+
+// getTokenFromGhConfigPath reads the token from the specified hosts.yml path.
+// This is split out from getTokenFromGhConfig for testability.
+func getTokenFromGhConfigPath(configPath string) (string, error) {
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		return "", fmt.Errorf("failed to read gh config: %w", err)
@@ -270,11 +276,19 @@ func (c *Client) GetIssue(owner, repo string, number int) (*Issue, string, error
 	return &issue, etag, nil
 }
 
-// UpdateIssue updates an issue's body.
-func (c *Client) UpdateIssue(owner, repo string, number int, body string) error {
+// UpdateIssue updates an issue's title and/or body.
+// Pass nil for title or body to leave that field unchanged.
+func (c *Client) UpdateIssue(owner, repo string, number int, title, body *string) error {
 	url := fmt.Sprintf("%s/repos/%s/%s/issues/%d", c.baseURL, owner, repo, number)
 
-	payload := map[string]string{"body": body}
+	payload := make(map[string]string)
+	if title != nil {
+		payload["title"] = *title
+	}
+	if body != nil {
+		payload["body"] = *body
+	}
+
 	jsonPayload, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("failed to marshal payload: %w", err)

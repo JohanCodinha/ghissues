@@ -1,8 +1,12 @@
 package gh
 
 import (
+	"bytes"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -31,8 +35,9 @@ func TestUpdateIssue_Success(t *testing.T) {
 
 	client := NewWithBaseURL("test-token", mockGH.URL)
 
-	// Update the issue
-	err := client.UpdateIssue("owner", "repo", 42, "New updated body")
+	// Update the issue (using pointer for body, nil for title)
+	newBody := "New updated body"
+	err := client.UpdateIssue("owner", "repo", 42, nil, &newBody)
 	if err != nil {
 		t.Fatalf("UpdateIssue() unexpected error: %v", err)
 	}
@@ -52,7 +57,8 @@ func TestUpdateIssue_NotFound(t *testing.T) {
 	client := NewWithBaseURL("test-token", mockGH.URL)
 
 	// Try to update a non-existent issue
-	err := client.UpdateIssue("owner", "repo", 999, "Some body")
+	body := "Some body"
+	err := client.UpdateIssue("owner", "repo", 999, nil, &body)
 	if err == nil {
 		t.Fatal("UpdateIssue() expected error for non-existent issue, got nil")
 	}
@@ -81,7 +87,8 @@ func TestUpdateIssue_ValidationError(t *testing.T) {
 
 	client := NewWithBaseURL("test-token", mockGH.URL)
 
-	err := client.UpdateIssue("owner", "repo", 42, "Invalid body content")
+	body := "Invalid body content"
+	err := client.UpdateIssue("owner", "repo", 42, nil, &body)
 	if err == nil {
 		t.Fatal("UpdateIssue() expected validation error, got nil")
 	}
@@ -108,7 +115,7 @@ func TestUpdateIssue_RequestBody(t *testing.T) {
 	client := NewWithBaseURL("test-token", mockGH.URL)
 
 	newBody := "This is the new body content with special chars: <>&\""
-	err := client.UpdateIssue("owner", "repo", 1, newBody)
+	err := client.UpdateIssue("owner", "repo", 1, nil, &newBody)
 	if err != nil {
 		t.Fatalf("UpdateIssue() unexpected error: %v", err)
 	}
@@ -584,4 +591,321 @@ func TestMain(m *testing.M) {
 	fmt.Println("Note: Integration tests require valid GitHub authentication.")
 	fmt.Println()
 	os.Exit(m.Run())
+}
+
+// =============================================================================
+// getTokenFromGhConfig Tests
+// =============================================================================
+
+func TestGetTokenFromGhConfigPath_ValidConfig(t *testing.T) {
+	tmpDir := t.TempDir()
+	configDir := filepath.Join(tmpDir, ".config", "gh")
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		t.Fatalf("failed to create config dir: %v", err)
+	}
+
+	hostsYml := `github.com:
+    oauth_token: test-token-12345
+    user: testuser
+`
+	configPath := filepath.Join(configDir, "hosts.yml")
+	if err := os.WriteFile(configPath, []byte(hostsYml), 0644); err != nil {
+		t.Fatalf("failed to write hosts.yml: %v", err)
+	}
+
+	token, err := getTokenFromGhConfigPath(configPath)
+	if err != nil {
+		t.Fatalf("getTokenFromGhConfigPath() unexpected error: %v", err)
+	}
+
+	if token != "test-token-12345" {
+		t.Errorf("expected token 'test-token-12345', got '%s'", token)
+	}
+}
+
+func TestGetTokenFromGhConfigPath_MissingOAuthToken(t *testing.T) {
+	tmpDir := t.TempDir()
+	configDir := filepath.Join(tmpDir, ".config", "gh")
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		t.Fatalf("failed to create config dir: %v", err)
+	}
+
+	// Config without oauth_token field
+	hostsYml := `github.com:
+    user: testuser
+`
+	configPath := filepath.Join(configDir, "hosts.yml")
+	if err := os.WriteFile(configPath, []byte(hostsYml), 0644); err != nil {
+		t.Fatalf("failed to write hosts.yml: %v", err)
+	}
+
+	token, err := getTokenFromGhConfigPath(configPath)
+	if err == nil {
+		t.Fatal("expected error for missing oauth_token, got nil")
+	}
+
+	if token != "" {
+		t.Errorf("expected empty token, got '%s'", token)
+	}
+
+	if !strings.Contains(err.Error(), "no oauth_token found") {
+		t.Errorf("expected 'no oauth_token found' error, got: %v", err)
+	}
+}
+
+func TestGetTokenFromGhConfigPath_EmptyOAuthToken(t *testing.T) {
+	tmpDir := t.TempDir()
+	configDir := filepath.Join(tmpDir, ".config", "gh")
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		t.Fatalf("failed to create config dir: %v", err)
+	}
+
+	// Config with empty oauth_token
+	hostsYml := `github.com:
+    oauth_token: ""
+    user: testuser
+`
+	configPath := filepath.Join(configDir, "hosts.yml")
+	if err := os.WriteFile(configPath, []byte(hostsYml), 0644); err != nil {
+		t.Fatalf("failed to write hosts.yml: %v", err)
+	}
+
+	token, err := getTokenFromGhConfigPath(configPath)
+	if err == nil {
+		t.Fatal("expected error for empty oauth_token, got nil")
+	}
+
+	if token != "" {
+		t.Errorf("expected empty token, got '%s'", token)
+	}
+}
+
+func TestGetTokenFromGhConfigPath_MalformedYAML(t *testing.T) {
+	tmpDir := t.TempDir()
+	configDir := filepath.Join(tmpDir, ".config", "gh")
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		t.Fatalf("failed to create config dir: %v", err)
+	}
+
+	// Invalid YAML
+	hostsYml := `github.com:
+    oauth_token: [invalid yaml
+    not proper: indentation
+`
+	configPath := filepath.Join(configDir, "hosts.yml")
+	if err := os.WriteFile(configPath, []byte(hostsYml), 0644); err != nil {
+		t.Fatalf("failed to write hosts.yml: %v", err)
+	}
+
+	token, err := getTokenFromGhConfigPath(configPath)
+	if err == nil {
+		t.Fatal("expected error for malformed YAML, got nil")
+	}
+
+	if token != "" {
+		t.Errorf("expected empty token, got '%s'", token)
+	}
+
+	if !strings.Contains(err.Error(), "failed to parse") {
+		t.Errorf("expected 'failed to parse' error, got: %v", err)
+	}
+}
+
+func TestGetTokenFromGhConfigPath_MissingFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "nonexistent", "hosts.yml")
+
+	token, err := getTokenFromGhConfigPath(configPath)
+	if err == nil {
+		t.Fatal("expected error for missing file, got nil")
+	}
+
+	if token != "" {
+		t.Errorf("expected empty token, got '%s'", token)
+	}
+
+	if !strings.Contains(err.Error(), "failed to read") {
+		t.Errorf("expected 'failed to read' error, got: %v", err)
+	}
+}
+
+func TestGetTokenFromGhConfigPath_NoGitHubHost(t *testing.T) {
+	tmpDir := t.TempDir()
+	configDir := filepath.Join(tmpDir, ".config", "gh")
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		t.Fatalf("failed to create config dir: %v", err)
+	}
+
+	// Config with different host, not github.com
+	hostsYml := `gitlab.com:
+    oauth_token: gitlab-token
+    user: testuser
+`
+	configPath := filepath.Join(configDir, "hosts.yml")
+	if err := os.WriteFile(configPath, []byte(hostsYml), 0644); err != nil {
+		t.Fatalf("failed to write hosts.yml: %v", err)
+	}
+
+	token, err := getTokenFromGhConfigPath(configPath)
+	if err == nil {
+		t.Fatal("expected error for missing github.com host, got nil")
+	}
+
+	if token != "" {
+		t.Errorf("expected empty token, got '%s'", token)
+	}
+}
+
+func TestGetTokenFromGhConfigPath_MultipleHosts(t *testing.T) {
+	tmpDir := t.TempDir()
+	configDir := filepath.Join(tmpDir, ".config", "gh")
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		t.Fatalf("failed to create config dir: %v", err)
+	}
+
+	// Config with multiple hosts
+	hostsYml := `github.enterprise.com:
+    oauth_token: enterprise-token
+    user: enterpriseuser
+github.com:
+    oauth_token: public-token-xyz
+    user: publicuser
+`
+	configPath := filepath.Join(configDir, "hosts.yml")
+	if err := os.WriteFile(configPath, []byte(hostsYml), 0644); err != nil {
+		t.Fatalf("failed to write hosts.yml: %v", err)
+	}
+
+	token, err := getTokenFromGhConfigPath(configPath)
+	if err != nil {
+		t.Fatalf("getTokenFromGhConfigPath() unexpected error: %v", err)
+	}
+
+	// Should return the github.com token, not the enterprise one
+	if token != "public-token-xyz" {
+		t.Errorf("expected token 'public-token-xyz', got '%s'", token)
+	}
+}
+
+// =============================================================================
+// checkRateLimit Tests
+// =============================================================================
+
+func TestCheckRateLimit_LogsWarning(t *testing.T) {
+	// Create a response with X-RateLimit-Remaining: 0
+	resp := &http.Response{
+		Header: make(http.Header),
+	}
+	resp.Header.Set("X-RateLimit-Remaining", "0")
+	// Set reset time to 1 hour from now
+	resetTime := time.Now().Add(1 * time.Hour).Unix()
+	resp.Header.Set("X-RateLimit-Reset", fmt.Sprintf("%d", resetTime))
+
+	// Capture stderr
+	oldStderr := os.Stderr
+	r, w, _ := os.Pipe()
+	os.Stderr = w
+
+	// Call checkRateLimit
+	checkRateLimit(resp)
+
+	// Restore stderr and read captured output
+	w.Close()
+	os.Stderr = oldStderr
+	var buf bytes.Buffer
+	io.Copy(&buf, r)
+	output := buf.String()
+
+	// Verify warning was logged
+	if !strings.Contains(output, "WARNING") {
+		t.Errorf("expected warning to be logged, got: %s", output)
+	}
+	if !strings.Contains(output, "rate limit exceeded") {
+		t.Errorf("expected 'rate limit exceeded' in output, got: %s", output)
+	}
+}
+
+func TestCheckRateLimit_NoWarningWhenRemainingPositive(t *testing.T) {
+	// Create a response with remaining requests
+	resp := &http.Response{
+		Header: make(http.Header),
+	}
+	resp.Header.Set("X-RateLimit-Remaining", "100")
+	resp.Header.Set("X-RateLimit-Reset", fmt.Sprintf("%d", time.Now().Add(1*time.Hour).Unix()))
+
+	// Capture stderr
+	oldStderr := os.Stderr
+	r, w, _ := os.Pipe()
+	os.Stderr = w
+
+	// Call checkRateLimit
+	checkRateLimit(resp)
+
+	// Restore stderr and read captured output
+	w.Close()
+	os.Stderr = oldStderr
+	var buf bytes.Buffer
+	io.Copy(&buf, r)
+	output := buf.String()
+
+	// Verify no warning was logged
+	if output != "" {
+		t.Errorf("expected no output when rate limit remaining > 0, got: %s", output)
+	}
+}
+
+func TestCheckRateLimit_NoWarningWhenHeaderMissing(t *testing.T) {
+	// Create a response without rate limit headers
+	resp := &http.Response{
+		Header: make(http.Header),
+	}
+
+	// Capture stderr
+	oldStderr := os.Stderr
+	r, w, _ := os.Pipe()
+	os.Stderr = w
+
+	// Call checkRateLimit
+	checkRateLimit(resp)
+
+	// Restore stderr and read captured output
+	w.Close()
+	os.Stderr = oldStderr
+	var buf bytes.Buffer
+	io.Copy(&buf, r)
+	output := buf.String()
+
+	// Verify no warning was logged
+	if output != "" {
+		t.Errorf("expected no output when headers missing, got: %s", output)
+	}
+}
+
+func TestCheckRateLimit_NoWarningWhenResetMissing(t *testing.T) {
+	// Create a response with remaining=0 but no reset header
+	resp := &http.Response{
+		Header: make(http.Header),
+	}
+	resp.Header.Set("X-RateLimit-Remaining", "0")
+	// No X-RateLimit-Reset header
+
+	// Capture stderr
+	oldStderr := os.Stderr
+	r, w, _ := os.Pipe()
+	os.Stderr = w
+
+	// Call checkRateLimit
+	checkRateLimit(resp)
+
+	// Restore stderr and read captured output
+	w.Close()
+	os.Stderr = oldStderr
+	var buf bytes.Buffer
+	io.Copy(&buf, r)
+	output := buf.String()
+
+	// No warning should be logged because reset header is missing
+	if output != "" {
+		t.Errorf("expected no output when reset header missing, got: %s", output)
+	}
 }

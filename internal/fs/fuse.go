@@ -21,6 +21,8 @@ import (
 const (
 	// maxTitleLength is the maximum length for sanitized titles in filenames.
 	maxTitleLength = 50
+	// maxFileSize is the maximum allowed file size (10MB) to prevent unbounded memory growth.
+	maxFileSize = 10 * 1024 * 1024
 )
 
 // parseIssueTime parses an RFC3339 timestamp string and returns the time.
@@ -446,8 +448,13 @@ func (f *issueFileNode) Write(ctx context.Context, fh fs.FileHandle, data []byte
 	handle.mu.Lock()
 	defer handle.mu.Unlock()
 
-	// Extend buffer if necessary
+	// Check if write would exceed maximum file size
 	endPos := int(off) + len(data)
+	if endPos > maxFileSize {
+		return 0, syscall.EFBIG // File too large
+	}
+
+	// Extend buffer if necessary
 	if endPos > len(handle.buffer) {
 		newBuf := make([]byte, endPos)
 		copy(newBuf, handle.buffer)
@@ -492,9 +499,16 @@ func (f *issueFileNode) Flush(ctx context.Context, fh fs.FileHandle) syscall.Err
 	// Detect changes
 	changes := md.DetectChanges(original, parsed)
 
-	// If body changed, mark dirty in cache
-	if changes.BodyChanged {
-		err = f.cache.MarkDirty(f.repo, f.number, changes.NewBody)
+	// If title or body changed, mark dirty in cache
+	if changes.TitleChanged || changes.BodyChanged {
+		var titlePtr, bodyPtr *string
+		if changes.TitleChanged {
+			titlePtr = &changes.NewTitle
+		}
+		if changes.BodyChanged {
+			bodyPtr = &changes.NewBody
+		}
+		err = f.cache.MarkDirty(f.repo, f.number, titlePtr, bodyPtr)
 		if err != nil {
 			return syscall.EIO
 		}

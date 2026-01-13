@@ -289,10 +289,24 @@ func (e *Engine) syncIssue(issue cache.Issue) error {
 		return nil
 	}
 
-	// Push update to GitHub
-	log.Printf("sync: pushing issue #%d to GitHub", issue.Number)
-	if err := e.client.UpdateIssue(e.owner, e.repoName, issue.Number, issue.Body); err != nil {
-		return fmt.Errorf("failed to update issue on GitHub: %w", err)
+	// Determine which fields changed and need to be pushed
+	var titlePtr, bodyPtr *string
+	if issue.Title != remoteIssue.Title {
+		titlePtr = &issue.Title
+	}
+	if issue.Body != remoteIssue.Body {
+		bodyPtr = &issue.Body
+	}
+
+	// Push update to GitHub (only if something changed)
+	if titlePtr != nil || bodyPtr != nil {
+		log.Printf("sync: pushing issue #%d to GitHub (title changed: %v, body changed: %v)",
+			issue.Number, titlePtr != nil, bodyPtr != nil)
+		if err := e.client.UpdateIssue(e.owner, e.repoName, issue.Number, titlePtr, bodyPtr); err != nil {
+			return fmt.Errorf("failed to update issue on GitHub: %w", err)
+		}
+	} else {
+		log.Printf("sync: issue #%d marked dirty but no changes detected, clearing dirty flag", issue.Number)
 	}
 
 	// Clear dirty flag on success

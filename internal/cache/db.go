@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -208,18 +209,36 @@ func (db *DB) ListIssues(repo string) ([]Issue, error) {
 	return issues, nil
 }
 
-// MarkDirty marks an issue as having local changes by updating the body,
+// MarkDirty marks an issue as having local changes by updating the title and/or body,
 // setting dirty=1, and updating local_updated_at to the current time.
-func (db *DB) MarkDirty(repo string, number int, newBody string) error {
+// Pass nil for newTitle or newBody to leave that field unchanged.
+func (db *DB) MarkDirty(repo string, number int, newTitle, newBody *string) error {
 	localUpdatedAt := time.Now().UTC().Format(time.RFC3339)
 
-	query := `
-		UPDATE issues
-		SET body = ?, dirty = 1, local_updated_at = ?
-		WHERE repo = ? AND number = ?
-	`
+	// Build dynamic query based on which fields are being updated
+	var setClauses []string
+	var args []interface{}
 
-	result, err := db.conn.Exec(query, newBody, localUpdatedAt, repo, number)
+	if newTitle != nil {
+		setClauses = append(setClauses, "title = ?")
+		args = append(args, *newTitle)
+	}
+	if newBody != nil {
+		setClauses = append(setClauses, "body = ?")
+		args = append(args, *newBody)
+	}
+
+	// Always set dirty and local_updated_at
+	setClauses = append(setClauses, "dirty = 1", "local_updated_at = ?")
+	args = append(args, localUpdatedAt, repo, number)
+
+	query := fmt.Sprintf(`
+		UPDATE issues
+		SET %s
+		WHERE repo = ? AND number = ?
+	`, strings.Join(setClauses, ", "))
+
+	result, err := db.conn.Exec(query, args...)
 	if err != nil {
 		return fmt.Errorf("failed to mark issue dirty: %w", err)
 	}

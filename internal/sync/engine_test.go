@@ -362,7 +362,8 @@ func TestCacheIntegration(t *testing.T) {
 	}
 
 	// Mark the issue dirty
-	err = db.MarkDirty("owner/repo", 1, "Updated body")
+	updatedBody := "Updated body"
+	err = db.MarkDirty("owner/repo", 1, nil, &updatedBody)
 	if err != nil {
 		t.Fatalf("failed to mark dirty: %v", err)
 	}
@@ -1086,5 +1087,146 @@ func TestSyncDirtyIssues_PartialFailure(t *testing.T) {
 	}
 	if cachedIssue3.Dirty {
 		t.Error("issue 3 should not be dirty after successful sync")
+	}
+}
+
+// TestSyncIssue_TitleChange tests that title changes are pushed to GitHub
+func TestSyncIssue_TitleChange(t *testing.T) {
+	engine, cacheDB, mockGH := setupTestEngine(t)
+	defer engine.Stop()
+	defer cacheDB.Close()
+	defer mockGH.Close()
+
+	baseTime := time.Date(2026, 1, 13, 10, 0, 0, 0, time.UTC)
+	localTime := baseTime.Add(1 * time.Hour) // Local is newer, should push
+
+	// Add issue to mock server with original title
+	mockGH.AddIssue(&gh.Issue{
+		Number:    1,
+		Title:     "Original Title",
+		Body:      "Original body",
+		State:     "open",
+		User:      gh.User{Login: "user1"},
+		Labels:    []gh.Label{},
+		CreatedAt: baseTime,
+		UpdatedAt: baseTime,
+		ETag:      `"etag1"`,
+	})
+
+	// Insert issue into cache with modified title
+	cacheIssue := cache.Issue{
+		Number:         1,
+		Repo:           "owner/repo",
+		Title:          "Updated Title",
+		Body:           "Original body", // Body unchanged
+		State:          "open",
+		Author:         "user1",
+		Labels:         []string{},
+		CreatedAt:      baseTime.Format(time.RFC3339),
+		UpdatedAt:      baseTime.Format(time.RFC3339),
+		ETag:           `"etag1"`,
+		Dirty:          true,
+		LocalUpdatedAt: localTime.Format(time.RFC3339),
+	}
+	if err := cacheDB.UpsertIssue(cacheIssue); err != nil {
+		t.Fatalf("failed to upsert issue: %v", err)
+	}
+
+	// Trigger sync
+	err := engine.SyncNow()
+	if err != nil {
+		t.Logf("SyncNow returned error (may be expected): %v", err)
+	}
+
+	// Verify title was pushed to remote
+	remoteIssue := mockGH.GetIssue(1)
+	if remoteIssue == nil {
+		t.Fatal("remote issue not found")
+	}
+	if remoteIssue.Title != "Updated Title" {
+		t.Errorf("expected title %q, got %q", "Updated Title", remoteIssue.Title)
+	}
+	// Body should remain unchanged
+	if remoteIssue.Body != "Original body" {
+		t.Errorf("expected body %q (unchanged), got %q", "Original body", remoteIssue.Body)
+	}
+
+	// Verify issue is no longer dirty
+	cachedIssue, err := cacheDB.GetIssue("owner/repo", 1)
+	if err != nil {
+		t.Fatalf("failed to get cached issue: %v", err)
+	}
+	if cachedIssue.Dirty {
+		t.Error("issue should not be dirty after successful sync")
+	}
+}
+
+// TestSyncIssue_TitleAndBodyChange tests that both title and body changes are pushed
+func TestSyncIssue_TitleAndBodyChange(t *testing.T) {
+	engine, cacheDB, mockGH := setupTestEngine(t)
+	defer engine.Stop()
+	defer cacheDB.Close()
+	defer mockGH.Close()
+
+	baseTime := time.Date(2026, 1, 13, 10, 0, 0, 0, time.UTC)
+	localTime := baseTime.Add(1 * time.Hour) // Local is newer, should push
+
+	// Add issue to mock server with original values
+	mockGH.AddIssue(&gh.Issue{
+		Number:    1,
+		Title:     "Original Title",
+		Body:      "Original body",
+		State:     "open",
+		User:      gh.User{Login: "user1"},
+		Labels:    []gh.Label{},
+		CreatedAt: baseTime,
+		UpdatedAt: baseTime,
+		ETag:      `"etag1"`,
+	})
+
+	// Insert issue into cache with both title and body modified
+	cacheIssue := cache.Issue{
+		Number:         1,
+		Repo:           "owner/repo",
+		Title:          "New Title",
+		Body:           "New body content",
+		State:          "open",
+		Author:         "user1",
+		Labels:         []string{},
+		CreatedAt:      baseTime.Format(time.RFC3339),
+		UpdatedAt:      baseTime.Format(time.RFC3339),
+		ETag:           `"etag1"`,
+		Dirty:          true,
+		LocalUpdatedAt: localTime.Format(time.RFC3339),
+	}
+	if err := cacheDB.UpsertIssue(cacheIssue); err != nil {
+		t.Fatalf("failed to upsert issue: %v", err)
+	}
+
+	// Trigger sync
+	err := engine.SyncNow()
+	if err != nil {
+		t.Logf("SyncNow returned error (may be expected): %v", err)
+	}
+
+	// Verify both title and body were pushed to remote
+	remoteIssue := mockGH.GetIssue(1)
+	if remoteIssue == nil {
+		t.Fatal("remote issue not found")
+	}
+	if remoteIssue.Title != "New Title" {
+		t.Errorf("expected title %q, got %q", "New Title", remoteIssue.Title)
+	}
+	if remoteIssue.Body != "New body content" {
+		t.Errorf("expected body %q, got %q", "New body content", remoteIssue.Body)
+	}
+
+	// Verify issue is no longer dirty
+	cachedIssue, err := cacheDB.GetIssue("owner/repo", 1)
+	if err != nil {
+		t.Fatalf("failed to get cached issue: %v", err)
+	}
+	if cachedIssue.Dirty {
+		t.Error("issue should not be dirty after successful sync")
 	}
 }
