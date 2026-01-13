@@ -68,6 +68,7 @@ Each issue appears as `title[number].md`:
 
 ```
 ./issues/
+├── .status                    # sync status (read-only)
 ├── crash-on-startup[1234].md
 ├── add-dark-mode[1189].md
 └── fix-login-bug[1190].md
@@ -279,12 +280,38 @@ Available log levels:
 - Cache location: `~/.cache/ghissues/owner_repo.db`
 - Uses SQLite for reliability
 - Supports offline reads from cache
+- Pending changes persist across sessions and retry on next mount
+
+### Sync status
+
+A virtual `.status` file in the mountpoint shows current sync state:
+
+```bash
+cat ./issues/.status
+```
+
+```
+# ghissues status
+
+Last sync: 2026-01-14T10:30:00Z
+Pending issues: 0
+Pending comments: 2
+Dirty issues: 1
+Dirty comments: 0
+Last error: none
+```
 
 ### Conflict resolution
 
 If an issue is modified on GitHub after you started editing locally:
-- **Local wins** if your edit is newer
-- **Remote wins** if GitHub's version is newer (your changes stay dirty for manual resolution)
+- **Local wins** if your edit is newer than the remote version
+- **Remote wins** if GitHub's version is newer - your local changes are backed up to `~/.cache/ghissues/.conflicts/` before applying the remote version
+
+### Rate limiting
+
+GitHub API rate limits are handled automatically:
+- When rate limited, ghissues sleeps until the reset time and retries
+- No action required - operations resume automatically
 
 ## Development
 
@@ -300,7 +327,9 @@ ghissues/
 │   ├── fs/fuse.go            # FUSE filesystem
 │   ├── gh/client.go          # GitHub API client
 │   ├── md/format.go          # Markdown formatter
-│   └── sync/engine.go        # Sync engine
+│   └── sync/
+│       ├── engine.go         # Sync engine
+│       └── conflicts.go      # Conflict backup handling
 ├── scripts/
 │   ├── e2e-real-github.sh    # E2E test script
 │   └── run-integration-tests.sh
@@ -327,14 +356,6 @@ go test ./...
 # E2E against real GitHub (requires token with repo+delete_repo scopes)
 ./scripts/e2e-docker.sh
 ```
-
-## Roadmap
-
-- [x] **Slice 1:** Walking skeleton (mount, read, edit, sync)
-- [x] **Slice 2:** Comments rendering
-- [x] **Slice 3:** Edit title, add comments, create issues, edit state/labels, sub-issues
-- [ ] **Slice 4:** Robust offline mode, rate limiting
-- [ ] **Slice 5:** Pagination, filtering, real-time updates
 
 ## License
 
