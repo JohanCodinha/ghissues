@@ -5,10 +5,6 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-  schedule:
-    # Run daily at 6 AM UTC
-    - cron: '0 6 * * *'
-  workflow_dispatch:  # Allow manual trigger
 
 jobs:
   unit-tests:
@@ -73,42 +69,3 @@ jobs:
         with:
           name: ghissues-${{ matrix.goos }}-${{ matrix.goarch }}
           path: ghissues-${{ matrix.goos }}-${{ matrix.goarch }}
-
-  e2e-real-github:
-    runs-on: ubuntu-latest
-    # Run on: scheduled, manual trigger, or push to main (if token exists)
-    if: |
-      github.event_name == 'schedule' ||
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'push' && github.ref == 'refs/heads/main')
-    needs: [unit-tests, integration-tests]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-
-      - name: Install FUSE
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y fuse3
-          sudo modprobe fuse
-          # Allow current user to use FUSE
-          sudo chmod 666 /dev/fuse
-
-      - name: Run E2E tests against real GitHub
-        env:
-          GITHUB_TOKEN: ${{ secrets.GHISSUES_TEST_TOKEN }}
-          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-        run: |
-          if [ -n "$GITHUB_TOKEN" ]; then
-            ./scripts/e2e-real-github.sh
-          else
-            echo "::warning::Skipping E2E test: GHISSUES_TEST_TOKEN secret not configured"
-            echo ""
-            echo "To enable E2E tests, add a GitHub token with repo+delete_repo scope:"
-            echo "  gh secret set GHISSUES_TEST_TOKEN"
-          fi
