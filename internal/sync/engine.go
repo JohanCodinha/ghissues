@@ -63,19 +63,91 @@ func (e *Engine) ghIssueToCacheIssue(ghIssue *gh.Issue) cache.Issue {
 		labels[i] = l.Name
 	}
 
-	return cache.Issue{
-		Number:    ghIssue.Number,
-		Repo:      e.repo,
-		Title:     ghIssue.Title,
-		Body:      ghIssue.Body,
-		State:     ghIssue.State,
-		Author:    ghIssue.User.Login,
-		Labels:    labels,
-		CreatedAt: ghIssue.CreatedAt.Format(time.RFC3339),
-		UpdatedAt: ghIssue.UpdatedAt.Format(time.RFC3339),
-		ETag:      ghIssue.ETag,
-		Dirty:     false,
+	// Extract parent issue number from URL if present
+	parentIssueNumber := 0
+	if ghIssue.ParentIssueURL != "" {
+		parentIssueNumber = parseIssueNumberFromURL(ghIssue.ParentIssueURL)
 	}
+
+	// Extract sub-issues summary
+	subIssuesTotal := 0
+	subIssuesCompleted := 0
+	if ghIssue.SubIssuesSummary != nil {
+		subIssuesTotal = ghIssue.SubIssuesSummary.Total
+		subIssuesCompleted = ghIssue.SubIssuesSummary.Completed
+	}
+
+	return cache.Issue{
+		Number:             ghIssue.Number,
+		ID:                 ghIssue.ID,
+		Repo:               e.repo,
+		Title:              ghIssue.Title,
+		Body:               ghIssue.Body,
+		State:              ghIssue.State,
+		Author:             ghIssue.User.Login,
+		Labels:             labels,
+		CreatedAt:          ghIssue.CreatedAt.Format(time.RFC3339),
+		UpdatedAt:          ghIssue.UpdatedAt.Format(time.RFC3339),
+		ETag:               ghIssue.ETag,
+		Dirty:              false,
+		ParentIssueNumber:  parentIssueNumber,
+		SubIssuesTotal:     subIssuesTotal,
+		SubIssuesCompleted: subIssuesCompleted,
+	}
+}
+
+// parseIssueNumberFromURL extracts the issue number from a GitHub API URL.
+// Example: https://api.github.com/repos/owner/repo/issues/4 -> 4
+func parseIssueNumberFromURL(url string) int {
+	parts := strings.Split(url, "/")
+	if len(parts) == 0 {
+		return 0
+	}
+	lastPart := parts[len(parts)-1]
+	var number int
+	fmt.Sscanf(lastPart, "%d", &number)
+	return number
+}
+
+// syncParentIssue syncs the parent-child relationship for an issue.
+// It adds or removes the sub-issue relationship based on the local vs remote state.
+func (e *Engine) syncParentIssue(issue cache.Issue, remoteParentNumber int) error {
+	// Get the issue's numeric ID (needed for sub-issue API)
+	// We need to fetch the full issue to get its ID
+	ghIssue, _, err := e.client.GetIssue(e.owner, e.repoName, issue.Number)
+	if err != nil {
+		return fmt.Errorf("failed to get issue ID: %w", err)
+	}
+	issueID := ghIssue.ID
+
+	// If removing parent (was set, now 0)
+	if issue.ParentIssueNumber == 0 && remoteParentNumber > 0 {
+		logger.Debug("sync: removing issue #%d from parent #%d", issue.Number, remoteParentNumber)
+		if err := e.client.RemoveSubIssue(e.owner, e.repoName, remoteParentNumber, issueID); err != nil {
+			return fmt.Errorf("failed to remove sub-issue: %w", err)
+		}
+		return nil
+	}
+
+	// If setting new parent (was 0 or different, now set)
+	if issue.ParentIssueNumber > 0 {
+		// If there was an old parent, remove from it first
+		if remoteParentNumber > 0 && remoteParentNumber != issue.ParentIssueNumber {
+			logger.Debug("sync: removing issue #%d from old parent #%d", issue.Number, remoteParentNumber)
+			if err := e.client.RemoveSubIssue(e.owner, e.repoName, remoteParentNumber, issueID); err != nil {
+				logger.Warn("sync: failed to remove from old parent: %v", err)
+				// Continue to try adding to new parent
+			}
+		}
+
+		// Add to new parent
+		logger.Debug("sync: adding issue #%d as sub-issue of #%d", issue.Number, issue.ParentIssueNumber)
+		if err := e.client.AddSubIssue(e.owner, e.repoName, issue.ParentIssueNumber, issueID); err != nil {
+			return fmt.Errorf("failed to add sub-issue: %w", err)
+		}
+	}
+
+	return nil
 }
 
 // InitialSync fetches all issues from GitHub and populates the cache.
@@ -359,6 +431,15 @@ func (e *Engine) syncIssue(issue cache.Issue) error {
 		}
 	} else {
 		logger.Debug("sync: issue #%d marked dirty but no changes detected, clearing dirty flag", issue.Number)
+	}
+
+	// Handle parent issue changes (sub-issue relationships are managed via separate API)
+	remoteParentNumber := parseIssueNumberFromURL(remoteIssue.ParentIssueURL)
+	if issue.ParentIssueNumber != remoteParentNumber {
+		if err := e.syncParentIssue(issue, remoteParentNumber); err != nil {
+			logger.Warn("sync: failed to sync parent issue for #%d: %v", issue.Number, err)
+			// Don't fail the whole sync - the main issue update succeeded
+		}
 	}
 
 	// Clear dirty flag on success

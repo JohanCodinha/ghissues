@@ -19,19 +19,22 @@ type DB struct {
 
 // Issue represents a cached issue.
 type Issue struct {
-	ID             int64
-	Number         int
-	Repo           string
-	Title          string
-	Body           string
-	State          string
-	Author         string
-	Labels         []string // Stored as JSON array in database
-	CreatedAt      string
-	UpdatedAt      string
-	ETag           string
-	Dirty          bool
-	LocalUpdatedAt string
+	ID                 int64
+	Number             int
+	Repo               string
+	Title              string
+	Body               string
+	State              string
+	Author             string
+	Labels             []string // Stored as JSON array in database
+	CreatedAt          string
+	UpdatedAt          string
+	ETag               string
+	Dirty              bool
+	LocalUpdatedAt     string
+	ParentIssueNumber  int // 0 if no parent
+	SubIssuesTotal     int
+	SubIssuesCompleted int
 }
 
 // Comment represents a cached issue comment.
@@ -61,8 +64,18 @@ CREATE TABLE IF NOT EXISTS issues (
     etag TEXT,
     dirty INTEGER DEFAULT 0,
     local_updated_at TEXT,
+    parent_issue_number INTEGER DEFAULT 0,
+    sub_issues_total INTEGER DEFAULT 0,
+    sub_issues_completed INTEGER DEFAULT 0,
     UNIQUE(repo, number)
 );
+`
+
+// migrateSubIssuesSQL adds sub-issues columns to existing databases.
+const migrateSubIssuesSQL = `
+ALTER TABLE issues ADD COLUMN parent_issue_number INTEGER DEFAULT 0;
+ALTER TABLE issues ADD COLUMN sub_issues_total INTEGER DEFAULT 0;
+ALTER TABLE issues ADD COLUMN sub_issues_completed INTEGER DEFAULT 0;
 `
 
 // createCommentsTableSQL defines the schema for the comments table.
@@ -146,6 +159,12 @@ func InitDB(path string) (*DB, error) {
 		return nil, fmt.Errorf("failed to create pending_issues table: %w", err)
 	}
 
+	// Migrate: add sub-issues columns if they don't exist
+	// We run each ALTER TABLE separately and ignore errors (column may already exist)
+	conn.Exec("ALTER TABLE issues ADD COLUMN parent_issue_number INTEGER DEFAULT 0")
+	conn.Exec("ALTER TABLE issues ADD COLUMN sub_issues_total INTEGER DEFAULT 0")
+	conn.Exec("ALTER TABLE issues ADD COLUMN sub_issues_completed INTEGER DEFAULT 0")
+
 	return &DB{
 		path: path,
 		conn: conn,
@@ -178,8 +197,9 @@ func (db *DB) UpsertIssue(issue Issue) error {
 	query := `
 		INSERT OR REPLACE INTO issues (
 			number, repo, title, body, state, author, labels,
-			created_at, updated_at, etag, dirty, local_updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			created_at, updated_at, etag, dirty, local_updated_at,
+			parent_issue_number, sub_issues_total, sub_issues_completed
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
 
 	_, err = db.conn.Exec(query,
@@ -195,6 +215,9 @@ func (db *DB) UpsertIssue(issue Issue) error {
 		sql.NullString{String: issue.ETag, Valid: issue.ETag != ""},
 		dirtyInt,
 		sql.NullString{String: issue.LocalUpdatedAt, Valid: issue.LocalUpdatedAt != ""},
+		issue.ParentIssueNumber,
+		issue.SubIssuesTotal,
+		issue.SubIssuesCompleted,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to upsert issue: %w", err)
@@ -207,7 +230,8 @@ func (db *DB) UpsertIssue(issue Issue) error {
 func (db *DB) GetIssue(repo string, number int) (*Issue, error) {
 	query := `
 		SELECT id, number, repo, title, body, state, author, labels,
-		       created_at, updated_at, etag, dirty, local_updated_at
+		       created_at, updated_at, etag, dirty, local_updated_at,
+		       parent_issue_number, sub_issues_total, sub_issues_completed
 		FROM issues
 		WHERE repo = ? AND number = ?
 	`
@@ -220,7 +244,8 @@ func (db *DB) GetIssue(repo string, number int) (*Issue, error) {
 func (db *DB) ListIssues(repo string) ([]Issue, error) {
 	query := `
 		SELECT id, number, repo, title, body, state, author, labels,
-		       created_at, updated_at, etag, dirty, local_updated_at
+		       created_at, updated_at, etag, dirty, local_updated_at,
+		       parent_issue_number, sub_issues_total, sub_issues_completed
 		FROM issues
 		WHERE repo = ?
 		ORDER BY number ASC
@@ -251,10 +276,11 @@ func (db *DB) ListIssues(repo string) ([]Issue, error) {
 // IssueUpdate contains optional fields for updating an issue in the cache.
 // Nil fields are not updated.
 type IssueUpdate struct {
-	Title  *string
-	Body   *string
-	State  *string
-	Labels *[]string
+	Title             *string
+	Body              *string
+	State             *string
+	Labels            *[]string
+	ParentIssueNumber *int // nil = no change, 0 = remove parent, >0 = set parent
 }
 
 // MarkDirty marks an issue as having local changes by updating the specified fields,
@@ -286,6 +312,10 @@ func (db *DB) MarkDirty(repo string, number int, update IssueUpdate) error {
 		}
 		setClauses = append(setClauses, "labels = ?")
 		args = append(args, string(labelsJSON))
+	}
+	if update.ParentIssueNumber != nil {
+		setClauses = append(setClauses, "parent_issue_number = ?")
+		args = append(args, *update.ParentIssueNumber)
 	}
 
 	// Always set dirty and local_updated_at
@@ -319,7 +349,8 @@ func (db *DB) MarkDirty(repo string, number int, update IssueUpdate) error {
 func (db *DB) GetDirtyIssues(repo string) ([]Issue, error) {
 	query := `
 		SELECT id, number, repo, title, body, state, author, labels,
-		       created_at, updated_at, etag, dirty, local_updated_at
+		       created_at, updated_at, etag, dirty, local_updated_at,
+		       parent_issue_number, sub_issues_total, sub_issues_completed
 		FROM issues
 		WHERE repo = ? AND dirty = 1
 		ORDER BY number ASC
@@ -383,6 +414,7 @@ func scanIssueFrom(s scanner) (*Issue, error) {
 	var issue Issue
 	var body, state, author, labels, createdAt, updatedAt, etag, localUpdatedAt sql.NullString
 	var dirty int
+	var parentIssueNumber, subIssuesTotal, subIssuesCompleted sql.NullInt64
 
 	err := s.Scan(
 		&issue.ID,
@@ -398,6 +430,9 @@ func scanIssueFrom(s scanner) (*Issue, error) {
 		&etag,
 		&dirty,
 		&localUpdatedAt,
+		&parentIssueNumber,
+		&subIssuesTotal,
+		&subIssuesCompleted,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -415,6 +450,9 @@ func scanIssueFrom(s scanner) (*Issue, error) {
 	issue.ETag = etag.String
 	issue.LocalUpdatedAt = localUpdatedAt.String
 	issue.Dirty = dirty == 1
+	issue.ParentIssueNumber = int(parentIssueNumber.Int64)
+	issue.SubIssuesTotal = int(subIssuesTotal.Int64)
+	issue.SubIssuesCompleted = int(subIssuesCompleted.Int64)
 
 	// Parse labels JSON
 	if labels.Valid && labels.String != "" {

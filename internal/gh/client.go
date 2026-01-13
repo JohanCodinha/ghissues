@@ -34,17 +34,27 @@ type User struct {
 	Login string `json:"login"`
 }
 
+// SubIssuesSummary contains summary info about an issue's sub-issues.
+type SubIssuesSummary struct {
+	Total            int `json:"total"`
+	Completed        int `json:"completed"`
+	PercentCompleted int `json:"percent_completed"`
+}
+
 // Issue represents a GitHub issue.
 type Issue struct {
-	Number    int       `json:"number"`
-	Title     string    `json:"title"`
-	Body      string    `json:"body"`
-	State     string    `json:"state"`
-	Labels    []Label   `json:"labels"`
-	User      User      `json:"user"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-	ETag      string    `json:"-"` // Not from JSON, set from response header
+	Number           int               `json:"number"`
+	ID               int64             `json:"id"` // Numeric ID needed for sub-issues API
+	Title            string            `json:"title"`
+	Body             string            `json:"body"`
+	State            string            `json:"state"`
+	Labels           []Label           `json:"labels"`
+	User             User              `json:"user"`
+	CreatedAt        time.Time         `json:"created_at"`
+	UpdatedAt        time.Time         `json:"updated_at"`
+	ETag             string            `json:"-"` // Not from JSON, set from response header
+	ParentIssueURL   string            `json:"parent_issue_url,omitempty"`
+	SubIssuesSummary *SubIssuesSummary `json:"sub_issues_summary,omitempty"`
 }
 
 // Comment represents a GitHub issue comment.
@@ -511,4 +521,114 @@ func (c *Client) GetIssueWithEtag(owner, repo string, number int, etag string) (
 	issue.ETag = newEtag
 
 	return &issue, newEtag, nil
+}
+
+// ListSubIssues fetches all sub-issues for an issue.
+func (c *Client) ListSubIssues(owner, repo string, number int) ([]Issue, error) {
+	url := fmt.Sprintf("%s/repos/%s/%s/issues/%d/sub_issues", c.baseURL, owner, repo, number)
+
+	resp, err := c.doRequest("GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list sub-issues for issue #%d in %s/%s: %w", number, owner, repo, err)
+	}
+	defer resp.Body.Close()
+
+	checkRateLimit(resp)
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("failed to list sub-issues for issue #%d in %s/%s: API error %s - %s", number, owner, repo, resp.Status, string(body))
+	}
+
+	var subIssues []Issue
+	if err := json.NewDecoder(resp.Body).Decode(&subIssues); err != nil {
+		return nil, fmt.Errorf("failed to decode sub-issues response for issue #%d in %s/%s: %w", number, owner, repo, err)
+	}
+
+	return subIssues, nil
+}
+
+// GetParentIssue fetches the parent issue for a sub-issue.
+// Returns nil if the issue has no parent.
+func (c *Client) GetParentIssue(owner, repo string, number int) (*Issue, error) {
+	url := fmt.Sprintf("%s/repos/%s/%s/issues/%d/parent", c.baseURL, owner, repo, number)
+
+	resp, err := c.doRequest("GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get parent issue for #%d in %s/%s: %w", number, owner, repo, err)
+	}
+	defer resp.Body.Close()
+
+	checkRateLimit(resp)
+
+	// 404 means no parent
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, nil
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("failed to get parent issue for #%d in %s/%s: API error %s - %s", number, owner, repo, resp.Status, string(body))
+	}
+
+	var parent Issue
+	if err := json.NewDecoder(resp.Body).Decode(&parent); err != nil {
+		return nil, fmt.Errorf("failed to decode parent issue response for #%d in %s/%s: %w", number, owner, repo, err)
+	}
+
+	return &parent, nil
+}
+
+// AddSubIssue adds a sub-issue to a parent issue.
+// subIssueID is the numeric ID of the issue to add as sub-issue (not the issue number).
+func (c *Client) AddSubIssue(owner, repo string, parentNumber int, subIssueID int64) error {
+	url := fmt.Sprintf("%s/repos/%s/%s/issues/%d/sub_issues", c.baseURL, owner, repo, parentNumber)
+
+	payload := map[string]int64{"sub_issue_id": subIssueID}
+	jsonPayload, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal payload: %w", err)
+	}
+
+	resp, err := c.doRequest("POST", url, bytes.NewReader(jsonPayload))
+	if err != nil {
+		return fmt.Errorf("failed to add sub-issue to #%d in %s/%s: %w", parentNumber, owner, repo, err)
+	}
+	defer resp.Body.Close()
+
+	checkRateLimit(resp)
+
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("failed to add sub-issue to #%d in %s/%s: API error %s - %s", parentNumber, owner, repo, resp.Status, string(body))
+	}
+
+	return nil
+}
+
+// RemoveSubIssue removes a sub-issue from its parent.
+// subIssueID is the numeric ID of the issue to remove (not the issue number).
+func (c *Client) RemoveSubIssue(owner, repo string, parentNumber int, subIssueID int64) error {
+	url := fmt.Sprintf("%s/repos/%s/%s/issues/%d/sub_issue", c.baseURL, owner, repo, parentNumber)
+
+	payload := map[string]int64{"sub_issue_id": subIssueID}
+	jsonPayload, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal payload: %w", err)
+	}
+
+	resp, err := c.doRequest("DELETE", url, bytes.NewReader(jsonPayload))
+	if err != nil {
+		return fmt.Errorf("failed to remove sub-issue from #%d in %s/%s: %w", parentNumber, owner, repo, err)
+	}
+	defer resp.Body.Close()
+
+	checkRateLimit(resp)
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("failed to remove sub-issue from #%d in %s/%s: API error %s - %s", parentNumber, owner, repo, resp.Status, string(body))
+	}
+
+	return nil
 }

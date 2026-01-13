@@ -833,8 +833,8 @@ func (f *issueFileNode) Flush(ctx context.Context, fh fs.FileHandle) syscall.Err
 	// Track if we need to trigger sync
 	needsSync := false
 
-	// Check if any issue fields changed (title, body, state, labels)
-	if changes.TitleChanged || changes.BodyChanged || changes.StateChanged || changes.LabelsChanged {
+	// Check if any issue fields changed (title, body, state, labels, parent)
+	if changes.TitleChanged || changes.BodyChanged || changes.StateChanged || changes.LabelsChanged || changes.ParentIssueChanged {
 		update := cache.IssueUpdate{}
 		if changes.TitleChanged {
 			update.Title = &changes.NewTitle
@@ -847,6 +847,9 @@ func (f *issueFileNode) Flush(ctx context.Context, fh fs.FileHandle) syscall.Err
 		}
 		if changes.LabelsChanged {
 			update.Labels = &changes.NewLabels
+		}
+		if changes.ParentIssueChanged {
+			update.ParentIssueNumber = &changes.NewParentIssue
 		}
 		err = f.cache.MarkDirty(f.repo, f.number, update)
 		if err != nil {

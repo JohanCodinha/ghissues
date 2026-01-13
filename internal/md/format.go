@@ -18,11 +18,14 @@ type ParsedIssue struct {
 	Title  string
 	Body   string
 	// Frontmatter fields for reference
-	State    string
-	Labels   []string
-	Author   string
-	ETag     string
-	Comments []ParsedComment
+	State              string
+	Labels             []string
+	Author             string
+	ETag               string
+	Comments           []ParsedComment
+	ParentIssueNumber  int // 0 if no parent, parsed from frontmatter
+	SubIssuesTotal     int
+	SubIssuesCompleted int
 }
 
 // ParsedComment represents a comment parsed from markdown.
@@ -35,17 +38,19 @@ type ParsedComment struct {
 
 // Changes indicates what was modified between original and parsed issue.
 type Changes struct {
-	TitleChanged    bool
-	BodyChanged     bool
-	StateChanged    bool
-	LabelsChanged   bool
-	NewTitle        string
-	NewBody         string
-	NewState        string
-	NewLabels       []string
-	CommentChanges  []CommentChange
-	NewComments     []ParsedComment // Comments with IsNew=true
-	EditedComments  []CommentChange // Existing comments that were modified
+	TitleChanged        bool
+	BodyChanged         bool
+	StateChanged        bool
+	LabelsChanged       bool
+	ParentIssueChanged  bool
+	NewTitle            string
+	NewBody             string
+	NewState            string
+	NewLabels           []string
+	NewParentIssue      int // 0 to remove parent, >0 to set parent
+	CommentChanges      []CommentChange
+	NewComments         []ParsedComment // Comments with IsNew=true
+	EditedComments      []CommentChange // Existing comments that were modified
 }
 
 // CommentChange represents a change to an existing comment.
@@ -56,16 +61,19 @@ type CommentChange struct {
 
 // frontmatter represents the YAML frontmatter structure.
 type frontmatter struct {
-	ID        int      `yaml:"id"`
-	Repo      string   `yaml:"repo"`
-	URL       string   `yaml:"url"`
-	State     string   `yaml:"state"`
-	Labels    []string `yaml:"labels,omitempty,flow"`
-	Author    string   `yaml:"author"`
-	CreatedAt string   `yaml:"created_at"`
-	UpdatedAt string   `yaml:"updated_at"`
-	ETag      string   `yaml:"etag"`
-	Comments  int      `yaml:"comments"`
+	ID                 int      `yaml:"id"`
+	Repo               string   `yaml:"repo"`
+	URL                string   `yaml:"url"`
+	State              string   `yaml:"state"`
+	Labels             []string `yaml:"labels,omitempty,flow"`
+	Author             string   `yaml:"author"`
+	CreatedAt          string   `yaml:"created_at"`
+	UpdatedAt          string   `yaml:"updated_at"`
+	ETag               string   `yaml:"etag"`
+	Comments           int      `yaml:"comments"`
+	ParentIssue        int      `yaml:"parent_issue,omitempty"`
+	SubIssuesTotal     int      `yaml:"sub_issues_total,omitempty"`
+	SubIssuesCompleted int      `yaml:"sub_issues_completed,omitempty"`
 }
 
 // ToMarkdown converts a cache.Issue to markdown format with YAML frontmatter.
@@ -81,16 +89,19 @@ func ToMarkdown(issue *cache.Issue, comments ...[]cache.Comment) string {
 
 	// Build frontmatter
 	fm := frontmatter{
-		ID:        issue.Number,
-		Repo:      issue.Repo,
-		URL:       fmt.Sprintf("https://github.com/%s/issues/%d", issue.Repo, issue.Number),
-		State:     issue.State,
-		Labels:    issue.Labels,
-		Author:    issue.Author,
-		CreatedAt: issue.CreatedAt,
-		UpdatedAt: issue.UpdatedAt,
-		ETag:      issue.ETag,
-		Comments:  len(issueComments),
+		ID:                 issue.Number,
+		Repo:               issue.Repo,
+		URL:                fmt.Sprintf("https://github.com/%s/issues/%d", issue.Repo, issue.Number),
+		State:              issue.State,
+		Labels:             issue.Labels,
+		Author:             issue.Author,
+		CreatedAt:          issue.CreatedAt,
+		UpdatedAt:          issue.UpdatedAt,
+		ETag:               issue.ETag,
+		Comments:           len(issueComments),
+		ParentIssue:        issue.ParentIssueNumber,
+		SubIssuesTotal:     issue.SubIssuesTotal,
+		SubIssuesCompleted: issue.SubIssuesCompleted,
 	}
 
 	// Marshal frontmatter to YAML
@@ -168,6 +179,9 @@ func FromMarkdown(content string) (*ParsedIssue, error) {
 	parsed.Labels = fm.Labels
 	parsed.Author = fm.Author
 	parsed.ETag = fm.ETag
+	parsed.ParentIssueNumber = fm.ParentIssue
+	parsed.SubIssuesTotal = fm.SubIssuesTotal
+	parsed.SubIssuesCompleted = fm.SubIssuesCompleted
 
 	// Extract title from # heading
 	title, remaining := extractTitle(remaining)
@@ -213,6 +227,12 @@ func DetectChanges(original *cache.Issue, parsed *ParsedIssue) Changes {
 	if !labelsEqual(original.Labels, parsed.Labels) {
 		changes.LabelsChanged = true
 		changes.NewLabels = parsed.Labels
+	}
+
+	// Compare parent issue
+	if original.ParentIssueNumber != parsed.ParentIssueNumber {
+		changes.ParentIssueChanged = true
+		changes.NewParentIssue = parsed.ParentIssueNumber
 	}
 
 	return changes
