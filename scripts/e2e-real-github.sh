@@ -93,7 +93,7 @@ E2E_TEST_MARKER_ORIGINAL"
 ISSUE_BODY_ESCAPED=$(echo "$ISSUE_BODY" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))' 2>/dev/null || echo "$ISSUE_BODY" | sed 's/"/\\"/g' | tr '\n' ' ')
 
 ISSUE_RESULT=$(github_api POST "/repos/$TEST_REPO/issues" "{\"title\":\"$ISSUE_TITLE\",\"body\":$ISSUE_BODY_ESCAPED}")
-ISSUE_NUMBER=$(echo "$ISSUE_RESULT" | grep -o '"number":[0-9]*' | head -1 | cut -d: -f2)
+ISSUE_NUMBER=$(echo "$ISSUE_RESULT" | grep -o '"number": *[0-9]*' | head -1 | grep -o '[0-9]*')
 
 if [ -z "$ISSUE_NUMBER" ]; then
     echo "Failed to create issue:"
