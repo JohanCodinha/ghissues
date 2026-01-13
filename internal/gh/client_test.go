@@ -798,8 +798,8 @@ func TestCheckRateLimit_LogsWarning(t *testing.T) {
 		Header: make(http.Header),
 	}
 	resp.Header.Set("X-RateLimit-Remaining", "0")
-	// Set reset time to 1 second in the future (short enough to test sleep behavior)
-	resetTime := time.Now().Add(1 * time.Second).Unix()
+	// Set reset time to 2 seconds in the future (enough buffer for CI timing)
+	resetTime := time.Now().Add(2 * time.Second).Unix()
 	resp.Header.Set("X-RateLimit-Reset", fmt.Sprintf("%d", resetTime))
 
 	// Capture logger output
@@ -824,9 +824,9 @@ func TestCheckRateLimit_LogsWarning(t *testing.T) {
 		t.Error("expected checkRateLimit to return true (slept), got false")
 	}
 
-	// Should have slept for approximately 1 second
-	if elapsed < 500*time.Millisecond {
-		t.Errorf("expected sleep of ~1s, but elapsed time was %v", elapsed)
+	// Should have slept for approximately 1-2 seconds (allowing for CI timing variance)
+	if elapsed < 1*time.Second {
+		t.Errorf("expected sleep of ~1-2s, but elapsed time was %v", elapsed)
 	}
 
 	// Verify warning was logged
