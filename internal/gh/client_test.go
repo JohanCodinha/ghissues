@@ -798,8 +798,8 @@ func TestCheckRateLimit_LogsWarning(t *testing.T) {
 		Header: make(http.Header),
 	}
 	resp.Header.Set("X-RateLimit-Remaining", "0")
-	// Set reset time to 1 hour from now
-	resetTime := time.Now().Add(1 * time.Hour).Unix()
+	// Set reset time to 1 second in the future (short enough to test sleep behavior)
+	resetTime := time.Now().Add(1 * time.Second).Unix()
 	resp.Header.Set("X-RateLimit-Reset", fmt.Sprintf("%d", resetTime))
 
 	// Capture logger output
@@ -811,17 +811,30 @@ func TestCheckRateLimit_LogsWarning(t *testing.T) {
 		logger.SetLevel(logger.LevelInfo)
 	}()
 
-	// Call checkRateLimit
-	checkRateLimit(resp)
+	start := time.Now()
 
+	// Call checkRateLimit - should sleep until reset time
+	slept := checkRateLimit(resp)
+
+	elapsed := time.Since(start)
 	output := buf.String()
+
+	// Verify it actually slept
+	if !slept {
+		t.Error("expected checkRateLimit to return true (slept), got false")
+	}
+
+	// Should have slept for approximately 1 second
+	if elapsed < 500*time.Millisecond {
+		t.Errorf("expected sleep of ~1s, but elapsed time was %v", elapsed)
+	}
 
 	// Verify warning was logged
 	if !strings.Contains(output, "WARN") {
 		t.Errorf("expected warning to be logged, got: %s", output)
 	}
-	if !strings.Contains(output, "rate limit exceeded") {
-		t.Errorf("expected 'rate limit exceeded' in output, got: %s", output)
+	if !strings.Contains(output, "rate limited") {
+		t.Errorf("expected 'rate limited' in output, got: %s", output)
 	}
 }
 

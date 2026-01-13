@@ -595,11 +595,11 @@ func TestSyncIssue_ConflictResolution(t *testing.T) {
 			expectDirtyAfter: false,
 		},
 		{
-			name:             "remote newer than local - conflict, skip push",
+			name:             "remote newer than local - conflict, remote wins",
 			localUpdatedAt:   baseTime.Add(1 * time.Hour),
 			remoteUpdatedAt:  baseTime.Add(2 * time.Hour),
 			expectPush:       false,
-			expectDirtyAfter: true, // Issue stays dirty due to conflict
+			expectDirtyAfter: false, // Dirty cleared after applying remote version
 		},
 		{
 			name:             "same timestamp - local wins",

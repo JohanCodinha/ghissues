@@ -167,30 +167,61 @@ func getTokenFromGhConfigPath(configPath string) (string, error) {
 }
 
 // doRequest performs an HTTP request with authentication and returns the response.
+// Handles 429 rate limit responses by sleeping until reset time and retrying.
 func (c *Client) doRequest(method, url string, body io.Reader) (*http.Response, error) {
-	req, err := http.NewRequest(method, url, body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	req.Header.Set("Authorization", "Bearer "+c.token)
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
-
+	// If body is a bytes.Reader, we can retry by seeking back to start
+	var bodyBytes []byte
 	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
+		var err error
+		bodyBytes, err = io.ReadAll(body)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read request body: %w", err)
+		}
 	}
 
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
-	}
+	for {
+		var reqBody io.Reader
+		if bodyBytes != nil {
+			reqBody = bytes.NewReader(bodyBytes)
+		}
 
-	return resp, nil
+		req, err := http.NewRequest(method, url, reqBody)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create request: %w", err)
+		}
+
+		req.Header.Set("Authorization", "Bearer "+c.token)
+		req.Header.Set("Accept", "application/vnd.github+json")
+		req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+
+		if bodyBytes != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("request failed: %w", err)
+		}
+
+		// Handle rate limiting - sleep and retry
+		if resp.StatusCode == http.StatusTooManyRequests {
+			resp.Body.Close()
+			if checkRateLimit(resp) {
+				continue // Retry after sleeping
+			}
+			// If checkRateLimit didn't sleep (no valid reset header), wait 60s
+			logger.Warn("rate limited without reset header, waiting 60s")
+			time.Sleep(60 * time.Second)
+			continue
+		}
+
+		return resp, nil
+	}
 }
 
-// checkRateLimit logs rate limit information from response headers.
-func checkRateLimit(resp *http.Response) {
+// checkRateLimit checks rate limit headers and sleeps if rate limited.
+// Returns true if we were rate limited and slept (caller should retry).
+func checkRateLimit(resp *http.Response) bool {
 	remaining := resp.Header.Get("X-RateLimit-Remaining")
 	reset := resp.Header.Get("X-RateLimit-Reset")
 
@@ -198,9 +229,15 @@ func checkRateLimit(resp *http.Response) {
 		resetTime, err := strconv.ParseInt(reset, 10, 64)
 		if err == nil {
 			resetAt := time.Unix(resetTime, 0)
-			logger.Warn("GitHub API rate limit exceeded. Resets at %s", resetAt.Format(time.RFC3339))
+			sleepDuration := time.Until(resetAt)
+			if sleepDuration > 0 {
+				logger.Warn("rate limited, sleeping %v until %s", sleepDuration, resetAt.Format(time.RFC3339))
+				time.Sleep(sleepDuration)
+				return true
+			}
 		}
 	}
+	return false
 }
 
 // ListIssues fetches all open issues from the repository.

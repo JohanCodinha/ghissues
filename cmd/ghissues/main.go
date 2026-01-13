@@ -193,10 +193,15 @@ func runMount(cmd *cobra.Command, args []string) error {
 		logger.Warn("continuing in offline mode with cached data")
 	}
 
-	// 7. Create FS with onDirty callback to trigger sync
+	// 6b. Retry any pending items from previous session
+	if err := engine.SyncNow(); err != nil {
+		logger.Warn("failed to sync pending items: %v", err)
+	}
+
+	// 7. Create FS with onDirty callback to trigger sync and status provider
 	filesystem := fs.NewFS(cacheDB, repo, mountpoint, func() {
 		engine.TriggerSync()
-	})
+	}, engine)
 
 	// 8. Mount (blocks until unmount)
 	logger.Info("mounting %s to %s", repo, mountpoint)

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/JohanCodinha/ghissues/internal/cache"
+	"github.com/JohanCodinha/ghissues/internal/fs"
 	"github.com/JohanCodinha/ghissues/internal/gh"
 	"github.com/JohanCodinha/ghissues/internal/logger"
 )
@@ -25,6 +26,40 @@ type Engine struct {
 	mu     gosync.Mutex
 	timer  *time.Timer
 	stopCh chan struct{}
+
+	// status tracking
+	lastSyncTime time.Time
+	lastError    error
+}
+
+// GetStatus returns the current sync status.
+// Implements fs.StatusProvider interface.
+func (e *Engine) GetStatus() fs.SyncStatus {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	status := fs.SyncStatus{
+		LastSyncTime: e.lastSyncTime,
+	}
+	if e.lastError != nil {
+		status.LastError = e.lastError.Error()
+	}
+
+	// Get counts from cache
+	if pendingIssues, err := e.cache.GetPendingIssues(e.repo); err == nil {
+		status.PendingIssues = len(pendingIssues)
+	}
+	if pendingComments, err := e.cache.GetPendingComments(e.repo); err == nil {
+		status.PendingComments = len(pendingComments)
+	}
+	if dirtyIssues, err := e.cache.GetDirtyIssues(e.repo); err == nil {
+		status.DirtyIssues = len(dirtyIssues)
+	}
+	if dirtyComments, err := e.cache.GetDirtyComments(e.repo); err == nil {
+		status.DirtyComments = len(dirtyComments)
+	}
+
+	return status
 }
 
 // NewEngine creates a new sync engine.
@@ -323,14 +358,21 @@ func (e *Engine) SyncNow() error {
 		errs = append(errs, fmt.Errorf("dirty issues: %w", err))
 	}
 
+	// Update status tracking
+	e.mu.Lock()
+	e.lastSyncTime = time.Now()
 	if len(errs) > 0 {
 		// Join multiple errors into a single error with context
 		errMsgs := make([]string, len(errs))
-		for i, e := range errs {
-			errMsgs[i] = e.Error()
+		for i, err := range errs {
+			errMsgs[i] = err.Error()
 		}
-		return fmt.Errorf("sync errors: %s", strings.Join(errMsgs, "; "))
+		e.lastError = fmt.Errorf("sync errors: %s", strings.Join(errMsgs, "; "))
+		e.mu.Unlock()
+		return e.lastError
 	}
+	e.lastError = nil
+	e.mu.Unlock()
 
 	return nil
 }
@@ -386,12 +428,54 @@ func (e *Engine) syncIssue(issue cache.Issue) error {
 
 	remoteUpdatedAt := remoteIssue.UpdatedAt
 
-	// Conflict detection: if remote is newer, skip push (keep dirty for user to resolve)
+	// Conflict detection: if remote is newer, remote wins (backup local first)
 	if remoteUpdatedAt.After(localUpdatedAt) {
-		logger.Warn("sync: conflict detected for issue #%d - remote is newer (remote: %s, local: %s), keeping dirty",
+		logger.Warn("sync: conflict detected for issue #%d - remote is newer (remote: %s, local: %s), applying remote",
 			issue.Number, remoteUpdatedAt.Format(time.RFC3339), localUpdatedAt.Format(time.RFC3339))
-		// Per design: local wins UNLESS remote is newer
-		// So if remote is newer, we skip push and keep the issue dirty
+
+		// 1. Backup local version to .conflicts/
+		if err := e.backupConflict(issue); err != nil {
+			logger.Warn("sync: failed to backup conflict: %v", err)
+			// Continue anyway - don't fail the sync just because backup failed
+		}
+
+		// 2. Fetch comments from remote
+		ghComments, err := e.client.ListComments(e.owner, e.repoName, issue.Number)
+		if err != nil {
+			logger.Warn("sync: failed to fetch remote comments for conflict resolution: %v", err)
+			// Continue with issue update only
+		}
+
+		// 3. Overwrite cache with remote version
+		cacheIssue := e.ghIssueToCacheIssue(remoteIssue)
+		if err := e.cache.UpsertIssue(cacheIssue); err != nil {
+			return fmt.Errorf("failed to apply remote issue: %w", err)
+		}
+
+		// Update comments if we got them
+		if ghComments != nil {
+			cacheComments := make([]cache.Comment, len(ghComments))
+			for i, c := range ghComments {
+				cacheComments[i] = cache.Comment{
+					ID:          c.ID,
+					IssueNumber: issue.Number,
+					Repo:        e.repo,
+					Author:      c.User.Login,
+					Body:        c.Body,
+					CreatedAt:   c.CreatedAt.Format(time.RFC3339),
+					UpdatedAt:   c.UpdatedAt.Format(time.RFC3339),
+				}
+			}
+			if err := e.cache.UpsertComments(e.repo, issue.Number, cacheComments); err != nil {
+				logger.Warn("sync: failed to update comments from remote: %v", err)
+			}
+		}
+
+		// 4. Clear dirty flag since conflict is resolved
+		if err := e.cache.ClearDirty(e.repo, issue.Number); err != nil {
+			logger.Warn("sync: failed to clear dirty flag: %v", err)
+		}
+
 		return nil
 	}
 

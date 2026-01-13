@@ -1330,7 +1330,7 @@ func TestNewFS(t *testing.T) {
 	onDirtyCalled := false
 	onDirty := func() { onDirtyCalled = true }
 
-	fsys := NewFS(db, "owner/repo", "/mnt/issues", onDirty)
+	fsys := NewFS(db, "owner/repo", "/mnt/issues", onDirty, nil)
 
 	if fsys == nil {
 		t.Fatal("NewFS returned nil")

@@ -24,7 +24,24 @@ const (
 	maxTitleLength = 50
 	// maxFileSize is the maximum allowed file size (10MB) to prevent unbounded memory growth.
 	maxFileSize = 10 * 1024 * 1024
+	// statusFileIno is the reserved inode number for the .status file.
+	statusFileIno = 0xFFFFFFFF
 )
+
+// SyncStatus contains information about the current sync state.
+type SyncStatus struct {
+	LastSyncTime    time.Time
+	LastError       string
+	PendingIssues   int
+	PendingComments int
+	DirtyIssues     int
+	DirtyComments   int
+}
+
+// StatusProvider is implemented by sync.Engine to provide status information.
+type StatusProvider interface {
+	GetStatus() SyncStatus
+}
 
 // parseIssueTime parses an RFC3339 timestamp string and returns the time.
 // If the timestamp is empty or invalid, it returns the current time as a fallback.
@@ -138,22 +155,25 @@ func unsanitizeTitle(sanitized string) string {
 
 // FS represents the FUSE filesystem for GitHub issues.
 type FS struct {
-	cache      *cache.DB
-	repo       string
-	mountpoint string
-	server     *fuse.Server
-	onDirty    func() // called when an issue is marked dirty
+	cache          *cache.DB
+	repo           string
+	mountpoint     string
+	server         *fuse.Server
+	onDirty        func() // called when an issue is marked dirty
+	statusProvider StatusProvider
 }
 
 // NewFS creates a new FUSE filesystem instance.
 // The onDirty callback is called whenever an issue is marked dirty in the cache.
-// Pass nil if no callback is needed.
-func NewFS(cacheDB *cache.DB, repo, mountpoint string, onDirty func()) *FS {
+// The statusProvider is used to get sync status for the .status file.
+// Pass nil for either if not needed.
+func NewFS(cacheDB *cache.DB, repo, mountpoint string, onDirty func(), statusProvider StatusProvider) *FS {
 	return &FS{
-		cache:      cacheDB,
-		repo:       repo,
-		mountpoint: mountpoint,
-		onDirty:    onDirty,
+		cache:          cacheDB,
+		repo:           repo,
+		mountpoint:     mountpoint,
+		onDirty:        onDirty,
+		statusProvider: statusProvider,
 	}
 }
 
@@ -162,9 +182,10 @@ func NewFS(cacheDB *cache.DB, repo, mountpoint string, onDirty func()) *FS {
 func (f *FS) Mount() error {
 	// Create the root node
 	root := &rootNode{
-		cache:   f.cache,
-		repo:    f.repo,
-		onDirty: f.onDirty,
+		cache:          f.cache,
+		repo:           f.repo,
+		onDirty:        f.onDirty,
+		statusProvider: f.statusProvider,
 	}
 
 	// Create FUSE server options
@@ -215,9 +236,10 @@ func (f *FS) Unmount() error {
 // It implements fs.InodeEmbedder and fs.NodeReaddirer.
 type rootNode struct {
 	fs.Inode
-	cache   *cache.DB
-	repo    string
-	onDirty func()
+	cache          *cache.DB
+	repo           string
+	onDirty        func()
+	statusProvider StatusProvider
 }
 
 var _ = (fs.NodeReaddirer)((*rootNode)(nil))
@@ -244,7 +266,18 @@ func (r *rootNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 		return nil, syscall.EIO
 	}
 
-	entries := make([]fuse.DirEntry, 0, len(issues))
+	// +1 for .status file
+	entries := make([]fuse.DirEntry, 0, len(issues)+1)
+
+	// Add .status file if status provider is available
+	if r.statusProvider != nil {
+		entries = append(entries, fuse.DirEntry{
+			Name: ".status",
+			Ino:  statusFileIno,
+			Mode: fuse.S_IFREG,
+		})
+	}
+
 	for _, issue := range issues {
 		filename := makeFilename(issue.Title, issue.Number)
 		entries = append(entries, fuse.DirEntry{
@@ -259,6 +292,24 @@ func (r *rootNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 
 // Lookup finds a file by name and returns its inode.
 func (r *rootNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	// Handle .status file
+	if name == ".status" && r.statusProvider != nil {
+		content := r.generateStatusContent()
+		out.Mode = 0444 // Read-only
+		out.Size = uint64(len(content))
+		out.Ino = statusFileIno
+		now := time.Now()
+		out.SetTimes(&now, &now, &now)
+
+		node := &statusFileNode{
+			statusProvider: r.statusProvider,
+		}
+		return r.NewInode(ctx, node, fs.StableAttr{
+			Mode: fuse.S_IFREG,
+			Ino:  statusFileIno,
+		}), 0
+	}
+
 	// Parse the filename to get the issue number
 	number, ok := parseFilename(name)
 	if !ok {
@@ -908,3 +959,125 @@ type issueFileHandle struct {
 }
 
 var _ = (fs.FileHandle)((*issueFileHandle)(nil))
+
+// generateStatusContent generates the content for the .status file.
+func (r *rootNode) generateStatusContent() string {
+	status := r.statusProvider.GetStatus()
+
+	var sb strings.Builder
+	sb.WriteString("# ghissues status\n\n")
+
+	if status.LastSyncTime.IsZero() {
+		sb.WriteString("Last sync: never\n")
+	} else {
+		sb.WriteString(fmt.Sprintf("Last sync: %s\n", status.LastSyncTime.Format(time.RFC3339)))
+	}
+
+	sb.WriteString(fmt.Sprintf("Pending issues: %d\n", status.PendingIssues))
+	sb.WriteString(fmt.Sprintf("Pending comments: %d\n", status.PendingComments))
+	sb.WriteString(fmt.Sprintf("Dirty issues: %d\n", status.DirtyIssues))
+	sb.WriteString(fmt.Sprintf("Dirty comments: %d\n", status.DirtyComments))
+
+	if status.LastError == "" {
+		sb.WriteString("Last error: none\n")
+	} else {
+		sb.WriteString(fmt.Sprintf("Last error: %s\n", status.LastError))
+	}
+
+	return sb.String()
+}
+
+// statusFileNode represents the virtual .status file.
+type statusFileNode struct {
+	fs.Inode
+	statusProvider StatusProvider
+}
+
+var _ = (fs.NodeGetattrer)((*statusFileNode)(nil))
+var _ = (fs.NodeOpener)((*statusFileNode)(nil))
+var _ = (fs.NodeReader)((*statusFileNode)(nil))
+
+// Getattr returns the file attributes for the status file.
+func (s *statusFileNode) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
+	status := s.statusProvider.GetStatus()
+	content := s.generateContent(status)
+
+	out.Mode = 0444 // Read-only
+	out.Size = uint64(len(content))
+	out.Ino = statusFileIno
+	now := time.Now()
+	out.SetTimes(&now, &now, &now)
+	return 0
+}
+
+// Open opens the status file for reading.
+func (s *statusFileNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
+	// Reject write attempts
+	if flags&(syscall.O_WRONLY|syscall.O_RDWR) != 0 {
+		return nil, 0, syscall.EACCES
+	}
+
+	status := s.statusProvider.GetStatus()
+	content := s.generateContent(status)
+
+	return &statusFileHandle{content: []byte(content)}, fuse.FOPEN_DIRECT_IO, 0
+}
+
+// Read reads the status file content.
+func (s *statusFileNode) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
+	handle, ok := fh.(*statusFileHandle)
+	if !ok {
+		// No handle, generate content directly
+		status := s.statusProvider.GetStatus()
+		content := []byte(s.generateContent(status))
+		if off >= int64(len(content)) {
+			return fuse.ReadResultData(nil), 0
+		}
+		end := off + int64(len(dest))
+		if end > int64(len(content)) {
+			end = int64(len(content))
+		}
+		return fuse.ReadResultData(content[off:end]), 0
+	}
+
+	if off >= int64(len(handle.content)) {
+		return fuse.ReadResultData(nil), 0
+	}
+	end := off + int64(len(dest))
+	if end > int64(len(handle.content)) {
+		end = int64(len(handle.content))
+	}
+	return fuse.ReadResultData(handle.content[off:end]), 0
+}
+
+// generateContent generates the status file content.
+func (s *statusFileNode) generateContent(status SyncStatus) string {
+	var sb strings.Builder
+	sb.WriteString("# ghissues status\n\n")
+
+	if status.LastSyncTime.IsZero() {
+		sb.WriteString("Last sync: never\n")
+	} else {
+		sb.WriteString(fmt.Sprintf("Last sync: %s\n", status.LastSyncTime.Format(time.RFC3339)))
+	}
+
+	sb.WriteString(fmt.Sprintf("Pending issues: %d\n", status.PendingIssues))
+	sb.WriteString(fmt.Sprintf("Pending comments: %d\n", status.PendingComments))
+	sb.WriteString(fmt.Sprintf("Dirty issues: %d\n", status.DirtyIssues))
+	sb.WriteString(fmt.Sprintf("Dirty comments: %d\n", status.DirtyComments))
+
+	if status.LastError == "" {
+		sb.WriteString("Last error: none\n")
+	} else {
+		sb.WriteString(fmt.Sprintf("Last error: %s\n", status.LastError))
+	}
+
+	return sb.String()
+}
+
+// statusFileHandle holds the content of an open status file.
+type statusFileHandle struct {
+	content []byte
+}
+
+var _ = (fs.FileHandle)((*statusFileHandle)(nil))
