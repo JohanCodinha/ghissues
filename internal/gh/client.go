@@ -23,6 +23,9 @@ const (
 	apiBaseURL = "https://api.github.com"
 )
 
+// sleepFunc is the function used for sleeping. It can be replaced in tests.
+var sleepFunc = time.Sleep
+
 // Label represents a GitHub issue label.
 type Label struct {
 	Name  string `json:"name"`
@@ -211,7 +214,7 @@ func (c *Client) doRequest(method, url string, body io.Reader) (*http.Response, 
 			}
 			// If checkRateLimit didn't sleep (no valid reset header), wait 60s
 			logger.Warn("rate limited without reset header, waiting 60s")
-			time.Sleep(60 * time.Second)
+			sleepFunc(60 * time.Second)
 			continue
 		}
 
@@ -232,7 +235,7 @@ func checkRateLimit(resp *http.Response) bool {
 			sleepDuration := time.Until(resetAt)
 			if sleepDuration > 0 {
 				logger.Warn("rate limited, sleeping %v until %s", sleepDuration, resetAt.Format(time.RFC3339))
-				time.Sleep(sleepDuration)
+				sleepFunc(sleepDuration)
 				return true
 			}
 		}

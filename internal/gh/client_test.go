@@ -793,13 +793,23 @@ github.com:
 // =============================================================================
 
 func TestCheckRateLimit_LogsWarning(t *testing.T) {
+	// Mock the sleep function to avoid actual waiting
+	var sleepDuration time.Duration
+	sleepCalled := false
+	originalSleep := sleepFunc
+	sleepFunc = func(d time.Duration) {
+		sleepDuration = d
+		sleepCalled = true
+	}
+	defer func() { sleepFunc = originalSleep }()
+
 	// Create a response with X-RateLimit-Remaining: 0
 	resp := &http.Response{
 		Header: make(http.Header),
 	}
 	resp.Header.Set("X-RateLimit-Remaining", "0")
-	// Set reset time to 2 seconds in the future (enough buffer for CI timing)
-	resetTime := time.Now().Add(2 * time.Second).Unix()
+	// Set reset time to 1 hour in the future
+	resetTime := time.Now().Add(1 * time.Hour).Unix()
 	resp.Header.Set("X-RateLimit-Reset", fmt.Sprintf("%d", resetTime))
 
 	// Capture logger output
@@ -811,22 +821,22 @@ func TestCheckRateLimit_LogsWarning(t *testing.T) {
 		logger.SetLevel(logger.LevelInfo)
 	}()
 
-	start := time.Now()
-
-	// Call checkRateLimit - should sleep until reset time
+	// Call checkRateLimit - should call our mock sleep
 	slept := checkRateLimit(resp)
 
-	elapsed := time.Since(start)
 	output := buf.String()
 
-	// Verify it actually slept
+	// Verify it called sleep
 	if !slept {
 		t.Error("expected checkRateLimit to return true (slept), got false")
 	}
+	if !sleepCalled {
+		t.Error("expected sleep function to be called")
+	}
 
-	// Should have slept for approximately 1-2 seconds (allowing for CI timing variance)
-	if elapsed < 1*time.Second {
-		t.Errorf("expected sleep of ~1-2s, but elapsed time was %v", elapsed)
+	// Verify sleep duration is approximately 1 hour
+	if sleepDuration < 59*time.Minute || sleepDuration > 61*time.Minute {
+		t.Errorf("expected sleep duration ~1h, got %v", sleepDuration)
 	}
 
 	// Verify warning was logged
