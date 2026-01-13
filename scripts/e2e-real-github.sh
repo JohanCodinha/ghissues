@@ -379,7 +379,57 @@ else
 fi
 
 echo ""
-echo "=== Step 8.9: Test unsupported operations fail gracefully ==="
+echo "=== Step 8.9: Test adding labels via frontmatter ==="
+# Read current file content
+CURRENT_CONTENT=$(cat "$MOUNTPOINT/$ISSUE_FILE")
+
+# Modify labels in frontmatter and write back
+# Use a temp file to avoid issues with FUSE in-place editing
+echo "$CURRENT_CONTENT" | sed 's/labels: \[\]/labels: [e2e-test-label]/' > /tmp/e2e_modified_issue.md
+cat /tmp/e2e_modified_issue.md > "$MOUNTPOINT/$ISSUE_FILE"
+
+echo "Added label via frontmatter, waiting for sync..."
+sleep 5
+
+# Verify label was added on GitHub
+ISSUE_DATA=$(github_api GET "/repos/$TEST_REPO/issues/$ISSUE_NUMBER")
+if echo "$ISSUE_DATA" | grep -q "e2e-test-label"; then
+    echo "✓ Label added successfully via frontmatter"
+else
+    echo "WARNING: Label not found on GitHub (may need more sync time)"
+    echo "Issue labels: $(echo "$ISSUE_DATA" | grep -o '"labels":\[[^]]*\]')"
+fi
+
+echo ""
+echo "=== Step 8.10: Test changing state via frontmatter ==="
+# Read current file and change state to closed
+CURRENT_CONTENT=$(cat "$MOUNTPOINT/$ISSUE_FILE")
+echo "$CURRENT_CONTENT" | sed 's/state: open/state: closed/' > /tmp/e2e_modified_issue.md
+cat /tmp/e2e_modified_issue.md > "$MOUNTPOINT/$ISSUE_FILE"
+
+echo "Changed state to closed via frontmatter, waiting for sync..."
+sleep 5
+
+# Verify state was changed on GitHub
+ISSUE_DATA=$(github_api GET "/repos/$TEST_REPO/issues/$ISSUE_NUMBER")
+ISSUE_STATE=$(echo "$ISSUE_DATA" | grep -o '"state": *"[^"]*"' | head -1 | grep -o '"[^"]*"$' | tr -d '"')
+if [ "$ISSUE_STATE" = "closed" ]; then
+    echo "✓ Issue closed successfully via frontmatter"
+else
+    echo "WARNING: Issue state is '$ISSUE_STATE', expected 'closed'"
+fi
+
+# Reopen the issue for further testing
+CURRENT_CONTENT=$(cat "$MOUNTPOINT/$ISSUE_FILE")
+echo "$CURRENT_CONTENT" | sed 's/state: closed/state: open/' > /tmp/e2e_modified_issue.md
+cat /tmp/e2e_modified_issue.md > "$MOUNTPOINT/$ISSUE_FILE"
+sleep 5
+
+# Cleanup temp file
+rm -f /tmp/e2e_modified_issue.md
+
+echo ""
+echo "=== Step 8.11: Test unsupported operations fail gracefully ==="
 echo "Testing unsupported operations..."
 
 # rm (delete) should fail
