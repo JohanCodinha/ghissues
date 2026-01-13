@@ -36,9 +36,9 @@ func TestUpdateIssue_Success(t *testing.T) {
 
 	client := NewWithBaseURL("test-token", mockGH.URL)
 
-	// Update the issue (using pointer for body, nil for title)
+	// Update the issue (only body)
 	newBody := "New updated body"
-	err := client.UpdateIssue("owner", "repo", 42, nil, &newBody)
+	err := client.UpdateIssue("owner", "repo", 42, IssueUpdate{Body: &newBody})
 	if err != nil {
 		t.Fatalf("UpdateIssue() unexpected error: %v", err)
 	}
@@ -59,7 +59,7 @@ func TestUpdateIssue_NotFound(t *testing.T) {
 
 	// Try to update a non-existent issue
 	body := "Some body"
-	err := client.UpdateIssue("owner", "repo", 999, nil, &body)
+	err := client.UpdateIssue("owner", "repo", 999, IssueUpdate{Body: &body})
 	if err == nil {
 		t.Fatal("UpdateIssue() expected error for non-existent issue, got nil")
 	}
@@ -89,7 +89,7 @@ func TestUpdateIssue_ValidationError(t *testing.T) {
 	client := NewWithBaseURL("test-token", mockGH.URL)
 
 	body := "Invalid body content"
-	err := client.UpdateIssue("owner", "repo", 42, nil, &body)
+	err := client.UpdateIssue("owner", "repo", 42, IssueUpdate{Body: &body})
 	if err == nil {
 		t.Fatal("UpdateIssue() expected validation error, got nil")
 	}
@@ -116,7 +116,7 @@ func TestUpdateIssue_RequestBody(t *testing.T) {
 	client := NewWithBaseURL("test-token", mockGH.URL)
 
 	newBody := "This is the new body content with special chars: <>&\""
-	err := client.UpdateIssue("owner", "repo", 1, nil, &newBody)
+	err := client.UpdateIssue("owner", "repo", 1, IssueUpdate{Body: &newBody})
 	if err != nil {
 		t.Fatalf("UpdateIssue() unexpected error: %v", err)
 	}

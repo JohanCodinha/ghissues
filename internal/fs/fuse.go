@@ -523,10 +523,8 @@ func (f *newIssueFileNode) Flush(ctx context.Context, fh fs.FileHandle) syscall.
 		return syscall.EIO
 	}
 
-	// Extract labels from frontmatter (if any)
-	// For now, we don't parse labels from frontmatter (would need to extend ParsedIssue)
-	// Just use empty labels
-	var labels []string
+	// Use labels from frontmatter (parsed from YAML)
+	labels := parsed.Labels
 
 	// Get title and body from parsed content
 	title := parsed.Title
@@ -835,16 +833,22 @@ func (f *issueFileNode) Flush(ctx context.Context, fh fs.FileHandle) syscall.Err
 	// Track if we need to trigger sync
 	needsSync := false
 
-	// If title or body changed, mark dirty in cache
-	if changes.TitleChanged || changes.BodyChanged {
-		var titlePtr, bodyPtr *string
+	// Check if any issue fields changed (title, body, state, labels)
+	if changes.TitleChanged || changes.BodyChanged || changes.StateChanged || changes.LabelsChanged {
+		update := cache.IssueUpdate{}
 		if changes.TitleChanged {
-			titlePtr = &changes.NewTitle
+			update.Title = &changes.NewTitle
 		}
 		if changes.BodyChanged {
-			bodyPtr = &changes.NewBody
+			update.Body = &changes.NewBody
 		}
-		err = f.cache.MarkDirty(f.repo, f.number, titlePtr, bodyPtr)
+		if changes.StateChanged {
+			update.State = &changes.NewState
+		}
+		if changes.LabelsChanged {
+			update.Labels = &changes.NewLabels
+		}
+		err = f.cache.MarkDirty(f.repo, f.number, update)
 		if err != nil {
 			logger.Warn("fuse: Flush failed to mark issue #%d as dirty: %v", f.number, err)
 			return syscall.EIO

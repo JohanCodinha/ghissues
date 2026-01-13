@@ -248,23 +248,44 @@ func (db *DB) ListIssues(repo string) ([]Issue, error) {
 	return issues, nil
 }
 
-// MarkDirty marks an issue as having local changes by updating the title and/or body,
+// IssueUpdate contains optional fields for updating an issue in the cache.
+// Nil fields are not updated.
+type IssueUpdate struct {
+	Title  *string
+	Body   *string
+	State  *string
+	Labels *[]string
+}
+
+// MarkDirty marks an issue as having local changes by updating the specified fields,
 // setting dirty=1, and updating local_updated_at to the current time.
-// Pass nil for newTitle or newBody to leave that field unchanged.
-func (db *DB) MarkDirty(repo string, number int, newTitle, newBody *string) error {
+// Pass nil for fields you don't want to update.
+func (db *DB) MarkDirty(repo string, number int, update IssueUpdate) error {
 	localUpdatedAt := time.Now().UTC().Format(time.RFC3339)
 
 	// Build dynamic query based on which fields are being updated
 	var setClauses []string
 	var args []interface{}
 
-	if newTitle != nil {
+	if update.Title != nil {
 		setClauses = append(setClauses, "title = ?")
-		args = append(args, *newTitle)
+		args = append(args, *update.Title)
 	}
-	if newBody != nil {
+	if update.Body != nil {
 		setClauses = append(setClauses, "body = ?")
-		args = append(args, *newBody)
+		args = append(args, *update.Body)
+	}
+	if update.State != nil {
+		setClauses = append(setClauses, "state = ?")
+		args = append(args, *update.State)
+	}
+	if update.Labels != nil {
+		labelsJSON, err := json.Marshal(*update.Labels)
+		if err != nil {
+			return fmt.Errorf("failed to marshal labels: %w", err)
+		}
+		setClauses = append(setClauses, "labels = ?")
+		args = append(args, string(labelsJSON))
 	}
 
 	// Always set dirty and local_updated_at

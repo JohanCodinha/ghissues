@@ -19,6 +19,7 @@ type ParsedIssue struct {
 	Body   string
 	// Frontmatter fields for reference
 	State    string
+	Labels   []string
 	Author   string
 	ETag     string
 	Comments []ParsedComment
@@ -36,8 +37,12 @@ type ParsedComment struct {
 type Changes struct {
 	TitleChanged    bool
 	BodyChanged     bool
+	StateChanged    bool
+	LabelsChanged   bool
 	NewTitle        string
 	NewBody         string
+	NewState        string
+	NewLabels       []string
 	CommentChanges  []CommentChange
 	NewComments     []ParsedComment // Comments with IsNew=true
 	EditedComments  []CommentChange // Existing comments that were modified
@@ -160,6 +165,7 @@ func FromMarkdown(content string) (*ParsedIssue, error) {
 	parsed.Number = fm.ID
 	parsed.Repo = fm.Repo
 	parsed.State = fm.State
+	parsed.Labels = fm.Labels
 	parsed.Author = fm.Author
 	parsed.ETag = fm.ETag
 
@@ -197,7 +203,38 @@ func DetectChanges(original *cache.Issue, parsed *ParsedIssue) Changes {
 		changes.NewBody = parsed.Body
 	}
 
+	// Compare state
+	if original.State != parsed.State {
+		changes.StateChanged = true
+		changes.NewState = parsed.State
+	}
+
+	// Compare labels
+	if !labelsEqual(original.Labels, parsed.Labels) {
+		changes.LabelsChanged = true
+		changes.NewLabels = parsed.Labels
+	}
+
 	return changes
+}
+
+// labelsEqual compares two label slices for equality (order-independent).
+func labelsEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	// Build a set from a
+	aSet := make(map[string]bool)
+	for _, label := range a {
+		aSet[label] = true
+	}
+	// Check all b labels are in a
+	for _, label := range b {
+		if !aSet[label] {
+			return false
+		}
+	}
+	return true
 }
 
 // DetectCommentChanges compares parsed comments with original cached comments.

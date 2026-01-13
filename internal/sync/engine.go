@@ -323,20 +323,38 @@ func (e *Engine) syncIssue(issue cache.Issue) error {
 		return nil
 	}
 
-	// Determine which fields changed and need to be pushed
-	var titlePtr, bodyPtr *string
+	// Build update struct with only changed fields
+	update := gh.IssueUpdate{}
+	hasChanges := false
+
 	if issue.Title != remoteIssue.Title {
-		titlePtr = &issue.Title
+		update.Title = &issue.Title
+		hasChanges = true
 	}
 	if issue.Body != remoteIssue.Body {
-		bodyPtr = &issue.Body
+		update.Body = &issue.Body
+		hasChanges = true
+	}
+	if issue.State != remoteIssue.State {
+		update.State = &issue.State
+		hasChanges = true
+	}
+
+	// Compare labels (convert remote labels to string slice)
+	remoteLabels := make([]string, len(remoteIssue.Labels))
+	for i, l := range remoteIssue.Labels {
+		remoteLabels[i] = l.Name
+	}
+	if !labelsEqual(issue.Labels, remoteLabels) {
+		update.Labels = &issue.Labels
+		hasChanges = true
 	}
 
 	// Push update to GitHub (only if something changed)
-	if titlePtr != nil || bodyPtr != nil {
-		logger.Debug("sync: pushing issue #%d to GitHub (title changed: %v, body changed: %v)",
-			issue.Number, titlePtr != nil, bodyPtr != nil)
-		if err := e.client.UpdateIssue(e.owner, e.repoName, issue.Number, titlePtr, bodyPtr); err != nil {
+	if hasChanges {
+		logger.Debug("sync: pushing issue #%d to GitHub (title: %v, body: %v, state: %v, labels: %v)",
+			issue.Number, update.Title != nil, update.Body != nil, update.State != nil, update.Labels != nil)
+		if err := e.client.UpdateIssue(e.owner, e.repoName, issue.Number, update); err != nil {
 			return fmt.Errorf("failed to update issue on GitHub: %w", err)
 		}
 	} else {
@@ -356,6 +374,23 @@ func (e *Engine) syncIssue(issue cache.Issue) error {
 
 	logger.Debug("sync: successfully synced issue #%d", issue.Number)
 	return nil
+}
+
+// labelsEqual compares two label slices for equality (order-independent).
+func labelsEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	aSet := make(map[string]bool)
+	for _, label := range a {
+		aSet[label] = true
+	}
+	for _, label := range b {
+		if !aSet[label] {
+			return false
+		}
+	}
+	return true
 }
 
 // Stop stops the sync engine and any pending timers.

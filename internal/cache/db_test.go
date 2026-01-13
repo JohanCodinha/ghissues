@@ -337,9 +337,9 @@ func TestMarkDirty_UpdatesBodyAndSetsFlag(t *testing.T) {
 	// Record time before marking dirty (with 1 second buffer for timing issues)
 	beforeMark := time.Now().UTC().Add(-1 * time.Second)
 
-	// Mark the issue as dirty with new body (nil for title, pointer for body)
+	// Mark the issue as dirty with new body
 	newBody := "Updated body content"
-	err := db.MarkDirty("owner/repo", 1, nil, &newBody)
+	err := db.MarkDirty("owner/repo", 1, IssueUpdate{Body: &newBody})
 	if err != nil {
 		t.Fatalf("MarkDirty failed: %v", err)
 	}
@@ -378,7 +378,7 @@ func TestMarkDirty_ReturnsErrorForNonExistentIssue(t *testing.T) {
 	defer cleanup()
 
 	body := "some body"
-	err := db.MarkDirty("owner/repo", 999, nil, &body)
+	err := db.MarkDirty("owner/repo", 999, IssueUpdate{Body: &body})
 	if err == nil {
 		t.Error("expected error for non-existent issue")
 	}
@@ -506,7 +506,7 @@ func TestWorkflow_MarkDirtyThenClear(t *testing.T) {
 
 	// User edits the file locally
 	newBody := "User edited body"
-	if err := db.MarkDirty("owner/repo", 1, nil, &newBody); err != nil {
+	if err := db.MarkDirty("owner/repo", 1, IssueUpdate{Body: &newBody}); err != nil {
 		t.Fatalf("failed to mark dirty: %v", err)
 	}
 

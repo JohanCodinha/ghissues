@@ -1456,3 +1456,183 @@ repo: ""
 		})
 	}
 }
+
+// Test: DetectChanges detects state changes
+func TestDetectChanges_DetectsStateChange(t *testing.T) {
+	original := &cache.Issue{
+		Number: 1,
+		Repo:   "test/repo",
+		Title:  "Test Issue",
+		Body:   "Test body",
+		State:  "open",
+		Labels: []string{"bug"},
+	}
+
+	parsed := &ParsedIssue{
+		Number: 1,
+		Repo:   "test/repo",
+		Title:  "Test Issue",
+		Body:   "Test body",
+		State:  "closed",
+		Labels: []string{"bug"},
+	}
+
+	changes := DetectChanges(original, parsed)
+
+	if !changes.StateChanged {
+		t.Error("expected StateChanged to be true")
+	}
+	if changes.NewState != "closed" {
+		t.Errorf("expected NewState to be 'closed', got %q", changes.NewState)
+	}
+	if changes.TitleChanged {
+		t.Error("expected TitleChanged to be false")
+	}
+	if changes.BodyChanged {
+		t.Error("expected BodyChanged to be false")
+	}
+	if changes.LabelsChanged {
+		t.Error("expected LabelsChanged to be false")
+	}
+}
+
+// Test: DetectChanges detects label changes
+func TestDetectChanges_DetectsLabelChange(t *testing.T) {
+	original := &cache.Issue{
+		Number: 1,
+		Repo:   "test/repo",
+		Title:  "Test Issue",
+		Body:   "Test body",
+		State:  "open",
+		Labels: []string{"bug"},
+	}
+
+	parsed := &ParsedIssue{
+		Number: 1,
+		Repo:   "test/repo",
+		Title:  "Test Issue",
+		Body:   "Test body",
+		State:  "open",
+		Labels: []string{"bug", "enhancement"},
+	}
+
+	changes := DetectChanges(original, parsed)
+
+	if !changes.LabelsChanged {
+		t.Error("expected LabelsChanged to be true")
+	}
+	if len(changes.NewLabels) != 2 {
+		t.Errorf("expected 2 new labels, got %d", len(changes.NewLabels))
+	}
+	if changes.StateChanged {
+		t.Error("expected StateChanged to be false")
+	}
+}
+
+// Test: DetectChanges handles label removal
+func TestDetectChanges_DetectsLabelRemoval(t *testing.T) {
+	original := &cache.Issue{
+		Number: 1,
+		Repo:   "test/repo",
+		Title:  "Test Issue",
+		Body:   "Test body",
+		State:  "open",
+		Labels: []string{"bug", "enhancement", "docs"},
+	}
+
+	parsed := &ParsedIssue{
+		Number: 1,
+		Repo:   "test/repo",
+		Title:  "Test Issue",
+		Body:   "Test body",
+		State:  "open",
+		Labels: []string{"bug"},
+	}
+
+	changes := DetectChanges(original, parsed)
+
+	if !changes.LabelsChanged {
+		t.Error("expected LabelsChanged to be true when labels are removed")
+	}
+	if len(changes.NewLabels) != 1 {
+		t.Errorf("expected 1 new label, got %d", len(changes.NewLabels))
+	}
+}
+
+// Test: labelsEqual handles order independence
+func TestLabelsEqual_OrderIndependent(t *testing.T) {
+	a := []string{"bug", "enhancement", "docs"}
+	b := []string{"docs", "bug", "enhancement"}
+
+	if !labelsEqual(a, b) {
+		t.Error("expected labels to be equal regardless of order")
+	}
+}
+
+// Test: labelsEqual handles empty slices
+func TestLabelsEqual_EmptySlices(t *testing.T) {
+	if !labelsEqual([]string{}, []string{}) {
+		t.Error("expected two empty slices to be equal")
+	}
+	if !labelsEqual(nil, nil) {
+		t.Error("expected two nil slices to be equal")
+	}
+	if !labelsEqual(nil, []string{}) {
+		t.Error("expected nil and empty slice to be equal")
+	}
+}
+
+// Test: FromMarkdown parses labels from frontmatter
+func TestFromMarkdown_ParsesLabels(t *testing.T) {
+	content := `---
+id: 1
+repo: test/repo
+state: open
+labels: [bug, enhancement]
+---
+
+# Test Issue
+
+## Body
+
+Test body`
+
+	parsed, err := FromMarkdown(content)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(parsed.Labels) != 2 {
+		t.Errorf("expected 2 labels, got %d", len(parsed.Labels))
+	}
+	if parsed.Labels[0] != "bug" {
+		t.Errorf("expected first label 'bug', got %q", parsed.Labels[0])
+	}
+	if parsed.Labels[1] != "enhancement" {
+		t.Errorf("expected second label 'enhancement', got %q", parsed.Labels[1])
+	}
+}
+
+// Test: FromMarkdown parses state from frontmatter
+func TestFromMarkdown_ParsesState(t *testing.T) {
+	content := `---
+id: 1
+repo: test/repo
+state: closed
+---
+
+# Test Issue
+
+## Body
+
+Test body`
+
+	parsed, err := FromMarkdown(content)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if parsed.State != "closed" {
+		t.Errorf("expected state 'closed', got %q", parsed.State)
+	}
+}

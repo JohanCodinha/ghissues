@@ -363,7 +363,7 @@ func TestCacheIntegration(t *testing.T) {
 
 	// Mark the issue dirty
 	updatedBody := "Updated body"
-	err = db.MarkDirty("owner/repo", 1, nil, &updatedBody)
+	err = db.MarkDirty("owner/repo", 1, cache.IssueUpdate{Body: &updatedBody})
 	if err != nil {
 		t.Fatalf("failed to mark dirty: %v", err)
 	}

@@ -277,17 +277,32 @@ func (c *Client) GetIssue(owner, repo string, number int) (*Issue, string, error
 	return &issue, etag, nil
 }
 
-// UpdateIssue updates an issue's title and/or body.
-// Pass nil for title or body to leave that field unchanged.
-func (c *Client) UpdateIssue(owner, repo string, number int, title, body *string) error {
+// IssueUpdate contains optional fields for updating an issue.
+// Nil fields are not included in the update request.
+type IssueUpdate struct {
+	Title  *string
+	Body   *string
+	State  *string   // "open" or "closed"
+	Labels *[]string // Replace all labels with this list
+}
+
+// UpdateIssue updates an issue's fields.
+// Only non-nil fields in the update struct are sent to GitHub.
+func (c *Client) UpdateIssue(owner, repo string, number int, update IssueUpdate) error {
 	url := fmt.Sprintf("%s/repos/%s/%s/issues/%d", c.baseURL, owner, repo, number)
 
-	payload := make(map[string]string)
-	if title != nil {
-		payload["title"] = *title
+	payload := make(map[string]interface{})
+	if update.Title != nil {
+		payload["title"] = *update.Title
 	}
-	if body != nil {
-		payload["body"] = *body
+	if update.Body != nil {
+		payload["body"] = *update.Body
+	}
+	if update.State != nil {
+		payload["state"] = *update.State
+	}
+	if update.Labels != nil {
+		payload["labels"] = *update.Labels
 	}
 
 	jsonPayload, err := json.Marshal(payload)
