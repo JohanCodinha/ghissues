@@ -1,0 +1,110 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run unit tests
+        run: go test -v -race ./...
+
+  integration-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install FUSE on host
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3
+          sudo modprobe fuse
+
+      - name: Build test container
+        run: docker build -f Dockerfile.test -t ghissues-integration .
+
+      - name: Run integration tests
+        run: |
+          docker run --rm \
+            --privileged \
+            --cap-add SYS_ADMIN \
+            --device /dev/fuse \
+            --security-opt apparmor:unconfined \
+            ghissues-integration
+
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goos: [linux, darwin]
+        goarch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          go build -o ghissues-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/ghissues
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghissues-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: ghissues-${{ matrix.goos }}-${{ matrix.goarch }}
+
+  e2e-smoke:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [unit-tests, integration-tests]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install FUSE on host
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3
+          sudo modprobe fuse
+
+      - name: Build test container
+        run: docker build -t ghissues-test .
+
+      - name: E2E smoke test
+        env:
+          GITHUB_TOKEN: ${{ secrets.GHISSUES_TEST_TOKEN }}
+        run: |
+          # Only run if test token is configured
+          if [ -n "$GITHUB_TOKEN" ]; then
+            docker run --rm \
+              --privileged \
+              --cap-add SYS_ADMIN \
+              --device /dev/fuse \
+              --security-opt apparmor:unconfined \
+              -e GITHUB_TOKEN \
+              ghissues-test sh -c '
+                ./ghissues mount JohanCodinha/ghissues /mnt/issues &
+                sleep 3
+                ls -la /mnt/issues/
+                cat /mnt/issues/*.md | head -20
+                umount /mnt/issues || true
+              '
+          else
+            echo "Skipping E2E test: GHISSUES_TEST_TOKEN not configured"
+          fi

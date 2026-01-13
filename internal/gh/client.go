@@ -49,6 +49,7 @@ type Issue struct {
 // Client is a GitHub API client.
 type Client struct {
 	token      string
+	baseURL    string
 	httpClient *http.Client
 }
 
@@ -64,6 +65,16 @@ type ghHost struct {
 func New(token string) *Client {
 	return &Client{
 		token:      token,
+		baseURL:    apiBaseURL,
+		httpClient: &http.Client{Timeout: 30 * time.Second},
+	}
+}
+
+// NewWithBaseURL creates a GitHub API client with a custom base URL (for testing).
+func NewWithBaseURL(token, baseURL string) *Client {
+	return &Client{
+		token:      token,
+		baseURL:    baseURL,
 		httpClient: &http.Client{Timeout: 30 * time.Second},
 	}
 }
@@ -170,7 +181,7 @@ func checkRateLimit(resp *http.Response) {
 // Handles pagination automatically.
 func (c *Client) ListIssues(owner, repo string) ([]Issue, error) {
 	var allIssues []Issue
-	url := fmt.Sprintf("%s/repos/%s/%s/issues?state=all&per_page=100", apiBaseURL, owner, repo)
+	url := fmt.Sprintf("%s/repos/%s/%s/issues?state=all&per_page=100", c.baseURL, owner, repo)
 
 	for url != "" {
 		resp, err := c.doRequest("GET", url, nil)
@@ -220,7 +231,7 @@ func getNextPageURL(linkHeader string) string {
 // GetIssue fetches a single issue by number.
 // Returns the issue, the ETag header value, and any error.
 func (c *Client) GetIssue(owner, repo string, number int) (*Issue, string, error) {
-	url := fmt.Sprintf("%s/repos/%s/%s/issues/%d", apiBaseURL, owner, repo, number)
+	url := fmt.Sprintf("%s/repos/%s/%s/issues/%d", c.baseURL, owner, repo, number)
 
 	resp, err := c.doRequest("GET", url, nil)
 	if err != nil {
@@ -248,7 +259,7 @@ func (c *Client) GetIssue(owner, repo string, number int) (*Issue, string, error
 
 // UpdateIssue updates an issue's body.
 func (c *Client) UpdateIssue(owner, repo string, number int, body string) error {
-	url := fmt.Sprintf("%s/repos/%s/%s/issues/%d", apiBaseURL, owner, repo, number)
+	url := fmt.Sprintf("%s/repos/%s/%s/issues/%d", c.baseURL, owner, repo, number)
 
 	payload := map[string]string{"body": body}
 	jsonPayload, err := json.Marshal(payload)
@@ -276,7 +287,7 @@ func (c *Client) UpdateIssue(owner, repo string, number int, body string) error 
 // Returns (nil, "", nil) on 304 Not Modified.
 // Returns (*Issue, newEtag, nil) on 200 OK with new data.
 func (c *Client) GetIssueWithEtag(owner, repo string, number int, etag string) (*Issue, string, error) {
-	url := fmt.Sprintf("%s/repos/%s/%s/issues/%d", apiBaseURL, owner, repo, number)
+	url := fmt.Sprintf("%s/repos/%s/%s/issues/%d", c.baseURL, owner, repo, number)
 
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {

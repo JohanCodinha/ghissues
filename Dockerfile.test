@@ -1,0 +1,19 @@
+FROM golang:alpine
+
+# Install FUSE and test dependencies
+RUN apk add --no-cache fuse3 fuse3-dev git
+
+ENV GOTOOLCHAIN=auto
+
+# Enable FUSE
+RUN echo "user_allow_other" >> /etc/fuse.conf
+
+WORKDIR /app
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+# Run integration tests (requires --privileged or --device /dev/fuse)
+CMD ["go", "test", "-v", "-tags=integration", "./internal/integration/..."]
