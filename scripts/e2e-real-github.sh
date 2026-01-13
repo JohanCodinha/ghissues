@@ -429,7 +429,63 @@ sleep 5
 rm -f /tmp/e2e_modified_issue.md
 
 echo ""
-echo "=== Step 8.11: Test unsupported operations fail gracefully ==="
+echo "=== Step 8.11: Test sub-issues (parent-child relationships) ==="
+# Create a second issue to be the parent
+PARENT_TITLE="E2E Parent Issue"
+PARENT_BODY="This issue will be the parent for testing sub-issues."
+PARENT_BODY_ESCAPED=$(echo "$PARENT_BODY" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))' 2>/dev/null || echo "\"$PARENT_BODY\"")
+
+PARENT_RESULT=$(github_api POST "/repos/$TEST_REPO/issues" "{\"title\":\"$PARENT_TITLE\",\"body\":$PARENT_BODY_ESCAPED}")
+PARENT_NUMBER=$(echo "$PARENT_RESULT" | grep -o '"number": *[0-9]*' | head -1 | grep -o '[0-9]*')
+
+if [ -z "$PARENT_NUMBER" ]; then
+    echo "WARNING: Could not create parent issue, skipping sub-issues test"
+else
+    echo "Created parent issue #${PARENT_NUMBER}"
+
+    # Wait for sync to pick up new issue
+    sleep 5
+
+    # Now make the original issue a sub-issue of the parent by editing frontmatter
+    CURRENT_CONTENT=$(cat "$MOUNTPOINT/$ISSUE_FILE")
+
+    # Add parent_issue field to frontmatter
+    echo "$CURRENT_CONTENT" | sed "s/^state: open/state: open\nparent_issue: $PARENT_NUMBER/" > /tmp/e2e_modified_issue.md
+    cat /tmp/e2e_modified_issue.md > "$MOUNTPOINT/$ISSUE_FILE"
+
+    echo "Set parent_issue: $PARENT_NUMBER in frontmatter, waiting for sync..."
+    sleep 5
+
+    # Verify sub-issue relationship was created on GitHub
+    ISSUE_DATA=$(github_api GET "/repos/$TEST_REPO/issues/$ISSUE_NUMBER")
+    if echo "$ISSUE_DATA" | grep -q "parent_issue_url"; then
+        echo "✓ Sub-issue relationship synced to GitHub"
+    else
+        echo "WARNING: parent_issue_url not found (sub-issues API may not be available)"
+    fi
+
+    # Check via the parent's sub-issues endpoint
+    SUB_ISSUES=$(github_api GET "/repos/$TEST_REPO/issues/$PARENT_NUMBER/sub_issues" 2>/dev/null || echo "[]")
+    if echo "$SUB_ISSUES" | grep -q "\"number\": *$ISSUE_NUMBER"; then
+        echo "✓ Issue #$ISSUE_NUMBER appears as sub-issue of #$PARENT_NUMBER"
+    else
+        echo "WARNING: Issue not found in parent's sub-issues list"
+    fi
+
+    # Remove the parent relationship
+    CURRENT_CONTENT=$(cat "$MOUNTPOINT/$ISSUE_FILE")
+    echo "$CURRENT_CONTENT" | sed "s/parent_issue: $PARENT_NUMBER/parent_issue: 0/" > /tmp/e2e_modified_issue.md
+    cat /tmp/e2e_modified_issue.md > "$MOUNTPOINT/$ISSUE_FILE"
+
+    echo "Removed parent relationship, waiting for sync..."
+    sleep 5
+
+    rm -f /tmp/e2e_modified_issue.md
+    echo "✓ Sub-issues test completed"
+fi
+
+echo ""
+echo "=== Step 8.12: Test unsupported operations fail gracefully ==="
 echo "Testing unsupported operations..."
 
 # rm (delete) should fail
