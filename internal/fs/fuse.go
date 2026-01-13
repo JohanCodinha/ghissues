@@ -223,6 +223,18 @@ type rootNode struct {
 var _ = (fs.NodeReaddirer)((*rootNode)(nil))
 var _ = (fs.NodeLookuper)((*rootNode)(nil))
 var _ = (fs.NodeCreater)((*rootNode)(nil))
+var _ = (fs.NodeUnlinker)((*rootNode)(nil))
+var _ = (fs.NodeRenamer)((*rootNode)(nil))
+
+// Unlink rejects file deletion - issues cannot be deleted via the filesystem.
+func (r *rootNode) Unlink(ctx context.Context, name string) syscall.Errno {
+	return syscall.EPERM
+}
+
+// Rename rejects file renaming - issues cannot be renamed via the filesystem.
+func (r *rootNode) Rename(ctx context.Context, name string, newParent fs.InodeEmbedder, newName string, flags uint32) syscall.Errno {
+	return syscall.EPERM
+}
 
 // Readdir returns the list of issue files in the directory.
 func (r *rootNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {

@@ -334,7 +334,7 @@ E2E_NEW_COMMENT_MARKER - This comment was added by editing the file directly.
 COMMENT_EOF
 
 echo "Added new comment via file edit, waiting for sync..."
-sleep 3
+sleep 5
 
 # Verify comment was created on GitHub
 COMMENTS_DATA=$(github_api GET "/repos/$TEST_REPO/issues/$ISSUE_NUMBER/comments")
