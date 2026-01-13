@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/JohanCodinha/ghissues/internal/cache"
+	"github.com/JohanCodinha/ghissues/internal/logger"
 	"github.com/JohanCodinha/ghissues/internal/md"
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
@@ -487,6 +488,7 @@ func (f *issueFileNode) Flush(ctx context.Context, fh fs.FileHandle) syscall.Err
 	parsed, err := md.FromMarkdown(content)
 	if err != nil {
 		// Can't parse the content, don't update
+		logger.Warn("failed to parse markdown for issue #%d: %v", f.number, err)
 		return syscall.EIO
 	}
 

@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/JohanCodinha/ghissues/internal/logger"
 	"gopkg.in/yaml.v3"
 )
 
@@ -187,7 +188,7 @@ func checkRateLimit(resp *http.Response) {
 		resetTime, err := strconv.ParseInt(reset, 10, 64)
 		if err == nil {
 			resetAt := time.Unix(resetTime, 0)
-			fmt.Fprintf(os.Stderr, "WARNING: GitHub API rate limit exceeded. Resets at %s\n", resetAt.Format(time.RFC3339))
+			logger.Warn("GitHub API rate limit exceeded. Resets at %s", resetAt.Format(time.RFC3339))
 		}
 	}
 }

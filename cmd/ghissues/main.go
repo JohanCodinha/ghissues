@@ -12,8 +12,16 @@ import (
 	"github.com/JohanCodinha/ghissues/internal/cache"
 	"github.com/JohanCodinha/ghissues/internal/fs"
 	"github.com/JohanCodinha/ghissues/internal/gh"
+	"github.com/JohanCodinha/ghissues/internal/logger"
 	"github.com/JohanCodinha/ghissues/internal/sync"
 	"github.com/spf13/cobra"
+)
+
+// CLI flags for logging configuration
+var (
+	logLevel string
+	logFile  string
+	quiet    bool
 )
 
 // validateRepo validates the repository format and returns the owner and repo name.
@@ -113,6 +121,11 @@ The mountpoint must be an existing directory where ghissues is mounted.`,
 }
 
 func init() {
+	// Add logging flags to mount command
+	mountCmd.Flags().StringVar(&logLevel, "log-level", "info", "Log level (debug, info, warn, error)")
+	mountCmd.Flags().StringVar(&logFile, "log-file", "", "Path to log file (logs to stderr if not set)")
+	mountCmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "Suppress non-error output")
+
 	rootCmd.AddCommand(mountCmd)
 	rootCmd.AddCommand(unmountCmd)
 }
@@ -120,6 +133,12 @@ func init() {
 func runMount(cmd *cobra.Command, args []string) error {
 	repo := args[0]
 	mountpoint := args[1]
+
+	// Configure logging based on CLI flags
+	if err := configureLogging(); err != nil {
+		return err
+	}
+	defer logger.Close()
 
 	// Validate repo format
 	owner, repoName, err := validateRepo(repo)
@@ -133,7 +152,7 @@ func runMount(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	if created {
-		fmt.Printf("created mountpoint %s\n", mountpoint)
+		logger.Info("created mountpoint %s", mountpoint)
 	}
 
 	// 1. Get GitHub auth token
@@ -141,7 +160,7 @@ func runMount(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("failed to get GitHub token: %w\nRun 'gh auth login' to authenticate", err)
 	}
-	fmt.Println("authenticated with GitHub")
+	logger.Info("authenticated with GitHub")
 
 	// 2. Create GitHub client
 	client := gh.New(token)
@@ -157,7 +176,7 @@ func runMount(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("failed to initialize cache: %w", err)
 	}
-	fmt.Printf("cache initialized at %s\n", cachePath)
+	logger.Info("cache initialized at %s", cachePath)
 
 	// 5. Create sync engine with 500ms debounce
 	engine, err := sync.NewEngine(cacheDB, client, repo, 500)
@@ -167,11 +186,11 @@ func runMount(cmd *cobra.Command, args []string) error {
 	}
 
 	// 6. Run initial sync
-	fmt.Printf("syncing issues from %s...\n", repo)
+	logger.Info("syncing issues from %s...", repo)
 	if err := engine.InitialSync(); err != nil {
-		// Print error but continue in offline mode
-		fmt.Fprintf(os.Stderr, "warning: initial sync failed: %v\n", err)
-		fmt.Fprintf(os.Stderr, "continuing in offline mode with cached data\n")
+		// Log warning but continue in offline mode
+		logger.Warn("initial sync failed: %v", err)
+		logger.Warn("continuing in offline mode with cached data")
 	}
 
 	// 7. Create FS with onDirty callback to trigger sync
@@ -180,16 +199,16 @@ func runMount(cmd *cobra.Command, args []string) error {
 	})
 
 	// 8. Mount (blocks until unmount)
-	fmt.Printf("mounting %s to %s\n", repo, mountpoint)
-	fmt.Println("press Ctrl+C to unmount")
+	logger.Info("mounting %s to %s", repo, mountpoint)
+	logger.Info("press Ctrl+C to unmount")
 	mountErr := filesystem.Mount()
 
 	// 9. Cleanup on return (after unmount)
-	fmt.Println("unmounting...")
+	logger.Info("unmounting...")
 
 	// Flush any pending changes
 	if err := engine.SyncNow(); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: failed to sync pending changes: %v\n", err)
+		logger.Warn("failed to sync pending changes: %v", err)
 	}
 
 	// Stop the sync engine
@@ -197,14 +216,39 @@ func runMount(cmd *cobra.Command, args []string) error {
 
 	// Close the cache
 	if err := cacheDB.Close(); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: failed to close cache: %v\n", err)
+		logger.Warn("failed to close cache: %v", err)
 	}
 
 	if mountErr != nil {
 		return fmt.Errorf("mount error: %w", mountErr)
 	}
 
-	fmt.Println("unmounted successfully")
+	logger.Info("unmounted successfully")
+	return nil
+}
+
+// configureLogging sets up the logger based on CLI flags.
+func configureLogging() error {
+	// Parse and set log level
+	level, err := logger.ParseLevel(logLevel)
+	if err != nil {
+		return err
+	}
+
+	// If quiet mode, only show errors
+	if quiet {
+		level = logger.LevelError
+	}
+
+	logger.SetLevel(level)
+
+	// Set up log file if specified
+	if logFile != "" {
+		if err := logger.SetLogFile(logFile); err != nil {
+			return fmt.Errorf("failed to set log file: %w", err)
+		}
+	}
+
 	return nil
 }
 

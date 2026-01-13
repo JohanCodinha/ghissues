@@ -3,13 +3,14 @@ package gh
 import (
 	"bytes"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/JohanCodinha/ghissues/internal/logger"
 )
 
 // =============================================================================
@@ -801,23 +802,22 @@ func TestCheckRateLimit_LogsWarning(t *testing.T) {
 	resetTime := time.Now().Add(1 * time.Hour).Unix()
 	resp.Header.Set("X-RateLimit-Reset", fmt.Sprintf("%d", resetTime))
 
-	// Capture stderr
-	oldStderr := os.Stderr
-	r, w, _ := os.Pipe()
-	os.Stderr = w
+	// Capture logger output
+	var buf bytes.Buffer
+	logger.SetOutput(&buf)
+	logger.SetLevel(logger.LevelWarn)
+	defer func() {
+		logger.SetOutput(os.Stderr)
+		logger.SetLevel(logger.LevelInfo)
+	}()
 
 	// Call checkRateLimit
 	checkRateLimit(resp)
 
-	// Restore stderr and read captured output
-	w.Close()
-	os.Stderr = oldStderr
-	var buf bytes.Buffer
-	io.Copy(&buf, r)
 	output := buf.String()
 
 	// Verify warning was logged
-	if !strings.Contains(output, "WARNING") {
+	if !strings.Contains(output, "WARN") {
 		t.Errorf("expected warning to be logged, got: %s", output)
 	}
 	if !strings.Contains(output, "rate limit exceeded") {
@@ -833,19 +833,18 @@ func TestCheckRateLimit_NoWarningWhenRemainingPositive(t *testing.T) {
 	resp.Header.Set("X-RateLimit-Remaining", "100")
 	resp.Header.Set("X-RateLimit-Reset", fmt.Sprintf("%d", time.Now().Add(1*time.Hour).Unix()))
 
-	// Capture stderr
-	oldStderr := os.Stderr
-	r, w, _ := os.Pipe()
-	os.Stderr = w
+	// Capture logger output
+	var buf bytes.Buffer
+	logger.SetOutput(&buf)
+	logger.SetLevel(logger.LevelWarn)
+	defer func() {
+		logger.SetOutput(os.Stderr)
+		logger.SetLevel(logger.LevelInfo)
+	}()
 
 	// Call checkRateLimit
 	checkRateLimit(resp)
 
-	// Restore stderr and read captured output
-	w.Close()
-	os.Stderr = oldStderr
-	var buf bytes.Buffer
-	io.Copy(&buf, r)
 	output := buf.String()
 
 	// Verify no warning was logged
@@ -860,19 +859,18 @@ func TestCheckRateLimit_NoWarningWhenHeaderMissing(t *testing.T) {
 		Header: make(http.Header),
 	}
 
-	// Capture stderr
-	oldStderr := os.Stderr
-	r, w, _ := os.Pipe()
-	os.Stderr = w
+	// Capture logger output
+	var buf bytes.Buffer
+	logger.SetOutput(&buf)
+	logger.SetLevel(logger.LevelWarn)
+	defer func() {
+		logger.SetOutput(os.Stderr)
+		logger.SetLevel(logger.LevelInfo)
+	}()
 
 	// Call checkRateLimit
 	checkRateLimit(resp)
 
-	// Restore stderr and read captured output
-	w.Close()
-	os.Stderr = oldStderr
-	var buf bytes.Buffer
-	io.Copy(&buf, r)
 	output := buf.String()
 
 	// Verify no warning was logged
@@ -889,19 +887,18 @@ func TestCheckRateLimit_NoWarningWhenResetMissing(t *testing.T) {
 	resp.Header.Set("X-RateLimit-Remaining", "0")
 	// No X-RateLimit-Reset header
 
-	// Capture stderr
-	oldStderr := os.Stderr
-	r, w, _ := os.Pipe()
-	os.Stderr = w
+	// Capture logger output
+	var buf bytes.Buffer
+	logger.SetOutput(&buf)
+	logger.SetLevel(logger.LevelWarn)
+	defer func() {
+		logger.SetOutput(os.Stderr)
+		logger.SetLevel(logger.LevelInfo)
+	}()
 
 	// Call checkRateLimit
 	checkRateLimit(resp)
 
-	// Restore stderr and read captured output
-	w.Close()
-	os.Stderr = oldStderr
-	var buf bytes.Buffer
-	io.Copy(&buf, r)
 	output := buf.String()
 
 	// No warning should be logged because reset header is missing

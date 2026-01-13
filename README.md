@@ -150,6 +150,28 @@ ghissues unmount ./mountpoint
 
 Or press `Ctrl+C` in the terminal running the mount.
 
+### Logging Options
+
+```bash
+# Set log level (default: info)
+ghissues mount owner/repo ./mount --log-level debug
+
+# Log to file
+ghissues mount owner/repo ./mount --log-file /var/log/ghissues.log
+
+# Quiet mode (errors only)
+ghissues mount owner/repo ./mount -q
+
+# Combine options
+ghissues mount owner/repo ./mount --log-level debug --log-file debug.log
+```
+
+Available log levels:
+- `debug`: Verbose output including sync details
+- `info`: General operational information (default)
+- `warn`: Warnings and potential issues
+- `error`: Errors only
+
 ## How it works
 
 ```

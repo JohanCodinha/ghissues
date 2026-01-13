@@ -3,13 +3,13 @@ package sync
 
 import (
 	"fmt"
-	"log"
 	"strings"
 	gosync "sync"
 	"time"
 
 	"github.com/JohanCodinha/ghissues/internal/cache"
 	"github.com/JohanCodinha/ghissues/internal/gh"
+	"github.com/JohanCodinha/ghissues/internal/logger"
 )
 
 // Engine handles synchronization between cache and GitHub.
@@ -59,14 +59,14 @@ func parseRepo(repo string) (string, string, error) {
 // InitialSync fetches all issues from GitHub and populates the cache.
 // This should be called on mount.
 func (e *Engine) InitialSync() error {
-	log.Printf("sync: starting initial sync for %s", e.repo)
+	logger.Debug("sync: starting initial sync for %s", e.repo)
 
 	issues, err := e.client.ListIssues(e.owner, e.repoName)
 	if err != nil {
 		return fmt.Errorf("failed to list issues: %w", err)
 	}
 
-	log.Printf("sync: fetched %d issues from GitHub", len(issues))
+	logger.Debug("sync: fetched %d issues from GitHub", len(issues))
 
 	for _, ghIssue := range issues {
 		// Convert labels to string slice
@@ -90,18 +90,18 @@ func (e *Engine) InitialSync() error {
 		}
 
 		if err := e.cache.UpsertIssue(cacheIssue); err != nil {
-			log.Printf("sync: failed to upsert issue #%d: %v", ghIssue.Number, err)
+			logger.Warn("sync: failed to upsert issue #%d: %v", ghIssue.Number, err)
 			// Continue with other issues
 		}
 
 		// Fetch comments for this issue
 		if err := e.syncComments(ghIssue.Number); err != nil {
-			log.Printf("sync: failed to sync comments for issue #%d: %v", ghIssue.Number, err)
+			logger.Warn("sync: failed to sync comments for issue #%d: %v", ghIssue.Number, err)
 			// Continue with other issues
 		}
 	}
 
-	log.Printf("sync: initial sync complete")
+	logger.Debug("sync: initial sync complete")
 	return nil
 }
 
@@ -130,7 +130,7 @@ func (e *Engine) syncComments(number int) error {
 		return fmt.Errorf("failed to upsert comments: %w", err)
 	}
 
-	log.Printf("sync: synced %d comments for issue #%d", len(cacheComments), number)
+	logger.Debug("sync: synced %d comments for issue #%d", len(cacheComments), number)
 	return nil
 }
 
@@ -149,7 +149,7 @@ func (e *Engine) RefreshIssue(number int) (bool, error) {
 
 	// Don't refresh dirty issues - local changes take precedence
 	if cachedIssue.Dirty {
-		log.Printf("sync: skipping refresh for dirty issue #%d", number)
+		logger.Debug("sync: skipping refresh for dirty issue #%d", number)
 		return false, nil
 	}
 
@@ -190,11 +190,11 @@ func (e *Engine) RefreshIssue(number int) (bool, error) {
 
 	// Also refresh comments for this issue
 	if err := e.syncComments(number); err != nil {
-		log.Printf("sync: warning: failed to refresh comments for issue #%d: %v", number, err)
+		logger.Warn("sync: failed to refresh comments for issue #%d: %v", number, err)
 		// Don't fail the whole refresh - issue update succeeded
 	}
 
-	log.Printf("sync: refreshed issue #%d from GitHub", number)
+	logger.Debug("sync: refreshed issue #%d from GitHub", number)
 	return true, nil
 }
 
@@ -212,11 +212,11 @@ func (e *Engine) TriggerSync() {
 	// Start new timer
 	e.timer = time.AfterFunc(time.Duration(e.debounceMs)*time.Millisecond, func() {
 		if err := e.syncDirtyIssues(); err != nil {
-			log.Printf("sync: error syncing dirty issues: %v", err)
+			logger.Error("sync: error syncing dirty issues: %v", err)
 		}
 	})
 
-	log.Printf("sync: debounce timer started/reset (%dms)", e.debounceMs)
+	logger.Debug("sync: debounce timer started/reset (%dms)", e.debounceMs)
 }
 
 // SyncNow immediately syncs all dirty issues.
@@ -241,11 +241,11 @@ func (e *Engine) syncDirtyIssues() error {
 	}
 
 	if len(dirtyIssues) == 0 {
-		log.Printf("sync: no dirty issues to sync")
+		logger.Debug("sync: no dirty issues to sync")
 		return nil
 	}
 
-	log.Printf("sync: syncing %d dirty issues", len(dirtyIssues))
+	logger.Debug("sync: syncing %d dirty issues", len(dirtyIssues))
 
 	var syncErrors []error
 	for _, issue := range dirtyIssues {
@@ -264,7 +264,7 @@ func (e *Engine) syncDirtyIssues() error {
 // syncIssue syncs a single dirty issue to GitHub.
 // Implements conflict detection: local wins UNLESS remote was updated more recently.
 func (e *Engine) syncIssue(issue cache.Issue) error {
-	log.Printf("sync: checking conflict for issue #%d", issue.Number)
+	logger.Debug("sync: checking conflict for issue #%d", issue.Number)
 
 	// Fetch remote to check updated_at
 	remoteIssue, _, err := e.client.GetIssue(e.owner, e.repoName, issue.Number)
@@ -282,7 +282,7 @@ func (e *Engine) syncIssue(issue cache.Issue) error {
 
 	// Conflict detection: if remote is newer, skip push (keep dirty for user to resolve)
 	if remoteUpdatedAt.After(localUpdatedAt) {
-		log.Printf("sync: conflict detected for issue #%d - remote is newer (remote: %s, local: %s), keeping dirty",
+		logger.Warn("sync: conflict detected for issue #%d - remote is newer (remote: %s, local: %s), keeping dirty",
 			issue.Number, remoteUpdatedAt.Format(time.RFC3339), localUpdatedAt.Format(time.RFC3339))
 		// Per design: local wins UNLESS remote is newer
 		// So if remote is newer, we skip push and keep the issue dirty
@@ -300,13 +300,13 @@ func (e *Engine) syncIssue(issue cache.Issue) error {
 
 	// Push update to GitHub (only if something changed)
 	if titlePtr != nil || bodyPtr != nil {
-		log.Printf("sync: pushing issue #%d to GitHub (title changed: %v, body changed: %v)",
+		logger.Debug("sync: pushing issue #%d to GitHub (title changed: %v, body changed: %v)",
 			issue.Number, titlePtr != nil, bodyPtr != nil)
 		if err := e.client.UpdateIssue(e.owner, e.repoName, issue.Number, titlePtr, bodyPtr); err != nil {
 			return fmt.Errorf("failed to update issue on GitHub: %w", err)
 		}
 	} else {
-		log.Printf("sync: issue #%d marked dirty but no changes detected, clearing dirty flag", issue.Number)
+		logger.Debug("sync: issue #%d marked dirty but no changes detected, clearing dirty flag", issue.Number)
 	}
 
 	// Clear dirty flag on success
@@ -317,10 +317,10 @@ func (e *Engine) syncIssue(issue cache.Issue) error {
 	// Refresh the issue to get updated etag and updated_at
 	if _, err := e.RefreshIssue(issue.Number); err != nil {
 		// Log but don't fail - the sync itself succeeded
-		log.Printf("sync: warning: failed to refresh issue #%d after sync: %v", issue.Number, err)
+		logger.Warn("sync: failed to refresh issue #%d after sync: %v", issue.Number, err)
 	}
 
-	log.Printf("sync: successfully synced issue #%d", issue.Number)
+	logger.Debug("sync: successfully synced issue #%d", issue.Number)
 	return nil
 }
 
@@ -342,7 +342,7 @@ func (e *Engine) Stop() {
 		close(e.stopCh)
 	}
 
-	log.Printf("sync: engine stopped")
+	logger.Debug("sync: engine stopped")
 }
 
 // HasConflict checks if an issue has a conflict (remote is newer than local).
