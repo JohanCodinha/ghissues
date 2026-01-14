@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="logo.svg" alt="ghissues logo" width="200">
+</p>
+
 # ghissues
 
 A FUSE filesystem that mounts GitHub issues as markdown files.
