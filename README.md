@@ -40,7 +40,21 @@ go build -o ghissues ./cmd/ghissues
 
 ### Pre-built binaries
 
-Download from [Releases](https://github.com/JohanCodinha/ghissues/releases) (linux/darwin, amd64/arm64).
+Download from [Releases](https://github.com/JohanCodinha/ghissues/releases):
+
+| Platform | Architecture | Binary |
+|----------|--------------|--------|
+| macOS | Apple Silicon (M1/M2/M3) | `ghissues-darwin-arm64` |
+| macOS | Intel | `ghissues-darwin-amd64` |
+| Linux | x86_64 | `ghissues-linux-amd64` |
+| Linux | ARM64 | `ghissues-linux-arm64` |
+
+```bash
+# Example: Install on macOS Apple Silicon
+curl -L https://github.com/JohanCodinha/ghissues/releases/latest/download/ghissues-darwin-arm64 -o ghissues
+chmod +x ghissues
+sudo mv ghissues /usr/local/bin/
+```
 
 ## Usage
 
@@ -335,7 +349,8 @@ ghissues/
 │   └── run-integration-tests.sh
 └── .github/workflows/
     ├── test.yml              # CI: unit + integration tests
-    └── e2e.yml               # Manual: real GitHub E2E test
+    ├── e2e.yml               # Manual: real GitHub E2E test
+    └── release.yml           # Auto-release on version tags
 ```
 
 ### Building
