@@ -10,6 +10,7 @@
 
 # Output of go coverage
 *.out
+coverage.html
 
 # Go workspace
 go.work
