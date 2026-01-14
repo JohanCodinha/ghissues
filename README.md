@@ -268,20 +268,15 @@ Available log levels:
 
 ## How it works
 
-```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│   Your      │────▶│   FUSE      │────▶│   SQLite    │
-│   Editor    │     │   Filesystem│     │   Cache     │
-└─────────────┘     └─────────────┘     └──────┬──────┘
-                                               │
-                    ┌─────────────┐             │
-                    │ Sync Engine │◀────────────┘
-                    │  (debounced)│
-                    └──────┬──────┘
-                           │
-                    ┌──────▼──────┐
-                    │ GitHub API  │
-                    └─────────────┘
+```mermaid
+flowchart LR
+    Editor[Your Editor] --> FUSE
+    CLI[CLI Tools] --> FUSE
+    Agent[LLM Agents] --> FUSE
+    Scripts[Scripts] --> FUSE
+    FUSE[FUSE Filesystem] --> Cache[(SQLite Cache)]
+    Cache --> Sync[Sync Engine<br/>debounced]
+    Sync --> GitHub[GitHub API]
 ```
 
 1. **On mount:** All issues are fetched and cached locally
@@ -388,4 +383,4 @@ open coverage.html
 
 ## License
 
-MIT
+GPL v3 - See [LICENSE](LICENSE) for details.
