@@ -883,6 +883,295 @@ func TestRefreshIssue_DirtySkipped(t *testing.T) {
 	}
 }
 
+// TestTriggerRefresh_SkipsWithinTTL tests that TriggerRefresh skips issues refreshed within TTL
+func TestTriggerRefresh_SkipsWithinTTL(t *testing.T) {
+	engine, cacheDB, mockGH := setupTestEngine(t)
+	defer engine.Stop()
+	defer cacheDB.Close()
+	defer mockGH.Close()
+
+	baseTime := time.Date(2026, 1, 13, 10, 0, 0, 0, time.UTC)
+
+	// Add issue to cache and mock server
+	cacheIssue := cache.Issue{
+		Number:    1,
+		Repo:      "owner/repo",
+		Title:     "Test Issue",
+		Body:      "Test body",
+		State:     "open",
+		Author:    "user1",
+		Labels:    []string{},
+		CreatedAt: baseTime.Format(time.RFC3339),
+		UpdatedAt: baseTime.Format(time.RFC3339),
+		ETag:      `"test-etag"`,
+	}
+	if err := cacheDB.UpsertIssue(cacheIssue); err != nil {
+		t.Fatalf("failed to upsert issue: %v", err)
+	}
+	mockGH.AddIssue(&gh.Issue{
+		Number:    1,
+		Title:     "Test Issue",
+		Body:      "Test body",
+		State:     "open",
+		User:      gh.User{Login: "user1"},
+		Labels:    []gh.Label{},
+		CreatedAt: baseTime,
+		UpdatedAt: baseTime,
+		ETag:      `"test-etag"`,
+	})
+
+	// Manually set last refresh time to now (simulating a recent refresh)
+	engine.refreshMu.Lock()
+	engine.refreshTimes[1] = time.Now()
+	engine.refreshMu.Unlock()
+
+	// Trigger refresh - should skip due to TTL
+	engine.TriggerRefresh(1)
+
+	// Give goroutine time to execute (if it did)
+	time.Sleep(50 * time.Millisecond)
+
+	// Check that no in-flight refresh is running (was skipped)
+	engine.refreshMu.Lock()
+	isRefreshing := engine.refreshing[1]
+	engine.refreshMu.Unlock()
+
+	if isRefreshing {
+		t.Error("expected refresh to be skipped due to TTL, but it's running")
+	}
+}
+
+// TestTriggerRefresh_SkipsInFlight tests that duplicate concurrent refreshes are skipped
+func TestTriggerRefresh_SkipsInFlight(t *testing.T) {
+	engine, cacheDB, mockGH := setupTestEngine(t)
+	defer engine.Stop()
+	defer cacheDB.Close()
+	defer mockGH.Close()
+
+	baseTime := time.Date(2026, 1, 13, 10, 0, 0, 0, time.UTC)
+
+	// Add issue to cache and mock server
+	cacheIssue := cache.Issue{
+		Number:    1,
+		Repo:      "owner/repo",
+		Title:     "Test Issue",
+		Body:      "Test body",
+		State:     "open",
+		Author:    "user1",
+		Labels:    []string{},
+		CreatedAt: baseTime.Format(time.RFC3339),
+		UpdatedAt: baseTime.Format(time.RFC3339),
+		ETag:      `"test-etag"`,
+	}
+	if err := cacheDB.UpsertIssue(cacheIssue); err != nil {
+		t.Fatalf("failed to upsert issue: %v", err)
+	}
+	mockGH.AddIssue(&gh.Issue{
+		Number:    1,
+		Title:     "Test Issue",
+		Body:      "Test body",
+		State:     "open",
+		User:      gh.User{Login: "user1"},
+		Labels:    []gh.Label{},
+		CreatedAt: baseTime,
+		UpdatedAt: baseTime,
+		ETag:      `"test-etag"`,
+	})
+
+	// Manually mark as in-flight (simulating an ongoing refresh)
+	engine.refreshMu.Lock()
+	engine.refreshing[1] = true
+	engine.refreshMu.Unlock()
+
+	// Trigger refresh - should skip due to in-flight check
+	engine.TriggerRefresh(1)
+
+	// Give goroutine time to execute (if it did)
+	time.Sleep(50 * time.Millisecond)
+
+	// Check refreshTimes was NOT updated (means TriggerRefresh skipped early)
+	engine.refreshMu.Lock()
+	_, hasRefreshTime := engine.refreshTimes[1]
+	engine.refreshMu.Unlock()
+
+	if hasRefreshTime {
+		t.Error("expected TriggerRefresh to skip when already in-flight")
+	}
+
+	// Clean up the manual in-flight flag
+	engine.refreshMu.Lock()
+	delete(engine.refreshing, 1)
+	engine.refreshMu.Unlock()
+}
+
+// TestTriggerRefresh_CallsRefreshIssue tests that TriggerRefresh actually calls RefreshIssue
+func TestTriggerRefresh_CallsRefreshIssue(t *testing.T) {
+	engine, cacheDB, mockGH := setupTestEngine(t)
+	defer engine.Stop()
+	defer cacheDB.Close()
+	defer mockGH.Close()
+
+	baseTime := time.Date(2026, 1, 13, 10, 0, 0, 0, time.UTC)
+
+	// Add issue to cache with old etag
+	cacheIssue := cache.Issue{
+		Number:    1,
+		Repo:      "owner/repo",
+		Title:     "Original Title",
+		Body:      "Original body",
+		State:     "open",
+		Author:    "user1",
+		Labels:    []string{},
+		CreatedAt: baseTime.Format(time.RFC3339),
+		UpdatedAt: baseTime.Format(time.RFC3339),
+		ETag:      `"old-etag"`,
+	}
+	if err := cacheDB.UpsertIssue(cacheIssue); err != nil {
+		t.Fatalf("failed to upsert issue: %v", err)
+	}
+
+	// Add updated issue to mock server with new etag
+	mockGH.AddIssue(&gh.Issue{
+		Number:    1,
+		Title:     "Updated Title",
+		Body:      "Updated body",
+		State:     "open",
+		User:      gh.User{Login: "user1"},
+		Labels:    []gh.Label{},
+		CreatedAt: baseTime,
+		UpdatedAt: baseTime.Add(1 * time.Hour),
+		ETag:      `"new-etag"`,
+	})
+
+	// Trigger refresh
+	engine.TriggerRefresh(1)
+
+	// Wait for background goroutine to complete
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify the issue was updated in cache
+	cachedIssue, err := cacheDB.GetIssue("owner/repo", 1)
+	if err != nil {
+		t.Fatalf("failed to get cached issue: %v", err)
+	}
+
+	if cachedIssue.Title != "Updated Title" {
+		t.Errorf("title = %q, want %q", cachedIssue.Title, "Updated Title")
+	}
+	if cachedIssue.Body != "Updated body" {
+		t.Errorf("body = %q, want %q", cachedIssue.Body, "Updated body")
+	}
+	if cachedIssue.ETag != `"new-etag"` {
+		t.Errorf("etag = %q, want %q", cachedIssue.ETag, `"new-etag"`)
+	}
+}
+
+// TestTriggerRefresh_RespectsStopCh tests that TriggerRefresh respects the stop channel
+func TestTriggerRefresh_RespectsStopCh(t *testing.T) {
+	engine, cacheDB, mockGH := setupTestEngine(t)
+	defer cacheDB.Close()
+	defer mockGH.Close()
+
+	baseTime := time.Date(2026, 1, 13, 10, 0, 0, 0, time.UTC)
+
+	// Add issue to cache
+	cacheIssue := cache.Issue{
+		Number:    1,
+		Repo:      "owner/repo",
+		Title:     "Test Issue",
+		Body:      "Test body",
+		State:     "open",
+		Author:    "user1",
+		Labels:    []string{},
+		CreatedAt: baseTime.Format(time.RFC3339),
+		UpdatedAt: baseTime.Format(time.RFC3339),
+		ETag:      `"test-etag"`,
+	}
+	if err := cacheDB.UpsertIssue(cacheIssue); err != nil {
+		t.Fatalf("failed to upsert issue: %v", err)
+	}
+
+	// Stop the engine before triggering refresh
+	engine.Stop()
+
+	// Trigger refresh - should exit early due to stopCh
+	engine.TriggerRefresh(1)
+
+	// Give goroutine time to check stopCh
+	time.Sleep(50 * time.Millisecond)
+
+	// The in-flight flag should have been cleared by the deferred function
+	engine.refreshMu.Lock()
+	isRefreshing := engine.refreshing[1]
+	engine.refreshMu.Unlock()
+
+	if isRefreshing {
+		t.Error("expected in-flight flag to be cleared after stopCh check")
+	}
+}
+
+// TestTriggerRefresh_MultipleConcurrent tests handling of multiple concurrent refresh requests
+func TestTriggerRefresh_MultipleConcurrent(t *testing.T) {
+	engine, cacheDB, mockGH := setupTestEngine(t)
+	defer engine.Stop()
+	defer cacheDB.Close()
+	defer mockGH.Close()
+
+	baseTime := time.Date(2026, 1, 13, 10, 0, 0, 0, time.UTC)
+
+	// Add multiple issues
+	for i := 1; i <= 5; i++ {
+		cacheIssue := cache.Issue{
+			Number:    i,
+			Repo:      "owner/repo",
+			Title:     "Test Issue",
+			Body:      "Test body",
+			State:     "open",
+			Author:    "user1",
+			Labels:    []string{},
+			CreatedAt: baseTime.Format(time.RFC3339),
+			UpdatedAt: baseTime.Format(time.RFC3339),
+			ETag:      `"test-etag"`,
+		}
+		if err := cacheDB.UpsertIssue(cacheIssue); err != nil {
+			t.Fatalf("failed to upsert issue %d: %v", i, err)
+		}
+		mockGH.AddIssue(&gh.Issue{
+			Number:    i,
+			Title:     "Test Issue",
+			Body:      "Test body",
+			State:     "open",
+			User:      gh.User{Login: "user1"},
+			Labels:    []gh.Label{},
+			CreatedAt: baseTime,
+			UpdatedAt: baseTime,
+			ETag:      `"test-etag"`,
+		})
+	}
+
+	// Trigger refresh for all issues concurrently
+	for i := 1; i <= 5; i++ {
+		engine.TriggerRefresh(i)
+	}
+
+	// Also trigger duplicate refreshes for the same issues
+	for i := 1; i <= 5; i++ {
+		engine.TriggerRefresh(i)
+	}
+
+	// Wait for all goroutines to complete
+	time.Sleep(200 * time.Millisecond)
+
+	// Verify no in-flight flags are left
+	engine.refreshMu.Lock()
+	remainingInFlight := len(engine.refreshing)
+	engine.refreshMu.Unlock()
+
+	if remainingInFlight != 0 {
+		t.Errorf("expected 0 in-flight refreshes, got %d", remainingInFlight)
+	}
+}
+
 // TestHasConflict tests conflict detection for various scenarios
 func TestHasConflict(t *testing.T) {
 	baseTime := time.Date(2026, 1, 13, 10, 0, 0, 0, time.UTC)

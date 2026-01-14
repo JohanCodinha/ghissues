@@ -74,7 +74,7 @@ func TestE2E_MountReadWrite(t *testing.T) {
 	// Create and mount filesystem
 	filesystem := fs.NewFS(cacheDB, repo, mountpoint, func() {
 		engine.TriggerSync()
-	}, nil)
+	}, nil, nil)
 
 	// Mount in goroutine (blocks until unmount)
 	mountErr := make(chan error, 1)
@@ -234,7 +234,7 @@ func TestE2E_IssueWithComments(t *testing.T) {
 	// Create and mount filesystem
 	filesystem := fs.NewFS(cacheDB, repo, mountpoint, func() {
 		engine.TriggerSync()
-	}, nil)
+	}, nil, nil)
 
 	// Mount in goroutine (blocks until unmount)
 	mountErr := make(chan error, 1)
@@ -344,7 +344,7 @@ func TestE2E_OfflineMode(t *testing.T) {
 	// Mount should still work (serves from cache)
 	filesystem := fs.NewFS(cacheDB, "test/repo", mountpoint, func() {
 		engine.TriggerSync()
-	}, nil)
+	}, nil, nil)
 
 	go filesystem.Mount()
 	time.Sleep(500 * time.Millisecond)
@@ -426,7 +426,7 @@ func TestE2E_LargeIssueWithManyComments(t *testing.T) {
 
 	filesystem := fs.NewFS(cacheDB, "test/repo", mountpoint, func() {
 		engine.TriggerSync()
-	}, nil)
+	}, nil, nil)
 
 	go filesystem.Mount()
 	time.Sleep(500 * time.Millisecond)
@@ -564,7 +564,7 @@ func TestE2E_SimilarTitles(t *testing.T) {
 
 	filesystem := fs.NewFS(cacheDB, "test/repo", mountpoint, func() {
 		engine.TriggerSync()
-	}, nil)
+	}, nil, nil)
 
 	go filesystem.Mount()
 	time.Sleep(500 * time.Millisecond)
@@ -664,7 +664,7 @@ func TestE2E_EmptyIssue(t *testing.T) {
 
 	filesystem := fs.NewFS(cacheDB, "test/repo", mountpoint, func() {
 		engine.TriggerSync()
-	}, nil)
+	}, nil, nil)
 
 	go filesystem.Mount()
 	time.Sleep(500 * time.Millisecond)
@@ -785,7 +785,7 @@ func TestE2E_GrepAcrossFiles(t *testing.T) {
 
 	filesystem := fs.NewFS(cacheDB, "test/repo", mountpoint, func() {
 		engine.TriggerSync()
-	}, nil)
+	}, nil, nil)
 
 	go filesystem.Mount()
 	time.Sleep(500 * time.Millisecond)
@@ -860,7 +860,7 @@ func TestE2E_AddNewComment(t *testing.T) {
 
 	filesystem := fs.NewFS(cacheDB, "testowner/testrepo", mountpoint, func() {
 		engine.TriggerSync()
-	}, nil)
+	}, nil, nil)
 
 	go filesystem.Mount()
 	time.Sleep(500 * time.Millisecond)
@@ -958,7 +958,7 @@ func TestE2E_EditExistingComment(t *testing.T) {
 
 	filesystem := fs.NewFS(cacheDB, "testowner/testrepo", mountpoint, func() {
 		engine.TriggerSync()
-	}, nil)
+	}, nil, nil)
 
 	go filesystem.Mount()
 	time.Sleep(500 * time.Millisecond)
@@ -1031,7 +1031,7 @@ func TestE2E_CreateNewIssue(t *testing.T) {
 
 	filesystem := fs.NewFS(cacheDB, "testowner/testrepo", mountpoint, func() {
 		engine.TriggerSync()
-	}, nil)
+	}, nil, nil)
 
 	go filesystem.Mount()
 	time.Sleep(500 * time.Millisecond)
@@ -1141,7 +1141,7 @@ func TestE2E_FindCommand(t *testing.T) {
 
 	filesystem := fs.NewFS(cacheDB, "test/repo", mountpoint, func() {
 		engine.TriggerSync()
-	}, nil)
+	}, nil, nil)
 
 	go filesystem.Mount()
 	time.Sleep(500 * time.Millisecond)

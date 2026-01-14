@@ -43,6 +43,11 @@ type StatusProvider interface {
 	GetStatus() SyncStatus
 }
 
+// RefreshProvider is implemented by sync.Engine to trigger background refresh.
+type RefreshProvider interface {
+	TriggerRefresh(number int)
+}
+
 // parseIssueTime parses an RFC3339 timestamp string and returns the time.
 // If the timestamp is empty or invalid, it returns the current time as a fallback.
 func parseIssueTime(timestamp string) time.Time {
@@ -155,25 +160,28 @@ func unsanitizeTitle(sanitized string) string {
 
 // FS represents the FUSE filesystem for GitHub issues.
 type FS struct {
-	cache          *cache.DB
-	repo           string
-	mountpoint     string
-	server         *fuse.Server
-	onDirty        func() // called when an issue is marked dirty
-	statusProvider StatusProvider
+	cache           *cache.DB
+	repo            string
+	mountpoint      string
+	server          *fuse.Server
+	onDirty         func() // called when an issue is marked dirty
+	statusProvider  StatusProvider
+	refreshProvider RefreshProvider
 }
 
 // NewFS creates a new FUSE filesystem instance.
 // The onDirty callback is called whenever an issue is marked dirty in the cache.
 // The statusProvider is used to get sync status for the .status file.
-// Pass nil for either if not needed.
-func NewFS(cacheDB *cache.DB, repo, mountpoint string, onDirty func(), statusProvider StatusProvider) *FS {
+// The refreshProvider is used to trigger background refresh on read.
+// Pass nil for any if not needed.
+func NewFS(cacheDB *cache.DB, repo, mountpoint string, onDirty func(), statusProvider StatusProvider, refreshProvider RefreshProvider) *FS {
 	return &FS{
-		cache:          cacheDB,
-		repo:           repo,
-		mountpoint:     mountpoint,
-		onDirty:        onDirty,
-		statusProvider: statusProvider,
+		cache:           cacheDB,
+		repo:            repo,
+		mountpoint:      mountpoint,
+		onDirty:         onDirty,
+		statusProvider:  statusProvider,
+		refreshProvider: refreshProvider,
 	}
 }
 
@@ -182,10 +190,11 @@ func NewFS(cacheDB *cache.DB, repo, mountpoint string, onDirty func(), statusPro
 func (f *FS) Mount() error {
 	// Create the root node
 	root := &rootNode{
-		cache:          f.cache,
-		repo:           f.repo,
-		onDirty:        f.onDirty,
-		statusProvider: f.statusProvider,
+		cache:           f.cache,
+		repo:            f.repo,
+		onDirty:         f.onDirty,
+		statusProvider:  f.statusProvider,
+		refreshProvider: f.refreshProvider,
 	}
 
 	// Create FUSE server options
@@ -236,10 +245,11 @@ func (f *FS) Unmount() error {
 // It implements fs.InodeEmbedder and fs.NodeReaddirer.
 type rootNode struct {
 	fs.Inode
-	cache          *cache.DB
-	repo           string
-	onDirty        func()
-	statusProvider StatusProvider
+	cache           *cache.DB
+	repo            string
+	onDirty         func()
+	statusProvider  StatusProvider
+	refreshProvider RefreshProvider
 }
 
 var _ = (fs.NodeReaddirer)((*rootNode)(nil))
@@ -314,6 +324,11 @@ func (r *rootNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) 
 	number, ok := parseFilename(name)
 	if !ok {
 		return nil, syscall.ENOENT
+	}
+
+	// Trigger background refresh (non-blocking)
+	if r.refreshProvider != nil {
+		r.refreshProvider.TriggerRefresh(number)
 	}
 
 	// Get the issue from the cache

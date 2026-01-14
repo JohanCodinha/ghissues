@@ -198,10 +198,10 @@ func runMount(cmd *cobra.Command, args []string) error {
 		logger.Warn("failed to sync pending items: %v", err)
 	}
 
-	// 7. Create FS with onDirty callback to trigger sync and status provider
+	// 7. Create FS with onDirty callback to trigger sync, status provider, and refresh provider
 	filesystem := fs.NewFS(cacheDB, repo, mountpoint, func() {
 		engine.TriggerSync()
-	}, engine)
+	}, engine, engine)
 
 	// 8. Mount (blocks until unmount)
 	logger.Info("mounting %s to %s", repo, mountpoint)

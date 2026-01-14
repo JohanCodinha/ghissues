@@ -30,6 +30,12 @@ type Engine struct {
 	// status tracking
 	lastSyncTime time.Time
 	lastError    error
+
+	// background refresh state
+	refreshTimes map[int]time.Time // last refresh time per issue
+	refreshing   map[int]bool      // in-flight refresh tracking
+	refreshMu    gosync.Mutex      // protects refresh state
+	refreshTTL   time.Duration     // TTL before allowing re-refresh (default 30s)
 }
 
 // GetStatus returns the current sync status.
@@ -72,13 +78,16 @@ func NewEngine(cacheDB *cache.DB, client *gh.Client, repo string, debounceMs int
 	}
 
 	return &Engine{
-		cache:      cacheDB,
-		client:     client,
-		repo:       repo,
-		owner:      owner,
-		repoName:   repoName,
-		debounceMs: debounceMs,
-		stopCh:     make(chan struct{}),
+		cache:        cacheDB,
+		client:       client,
+		repo:         repo,
+		owner:        owner,
+		repoName:     repoName,
+		debounceMs:   debounceMs,
+		stopCh:       make(chan struct{}),
+		refreshTimes: make(map[int]time.Time),
+		refreshing:   make(map[int]bool),
+		refreshTTL:   30 * time.Second,
 	}, nil
 }
 
@@ -289,6 +298,57 @@ func (e *Engine) RefreshIssue(number int) (bool, error) {
 
 	logger.Debug("sync: refreshed issue #%d from GitHub", number)
 	return true, nil
+}
+
+// TriggerRefresh schedules a background refresh for an issue if:
+// 1. The issue hasn't been refreshed within the TTL window
+// 2. A refresh isn't already in flight for this issue
+// This method returns immediately and doesn't block the caller.
+func (e *Engine) TriggerRefresh(number int) {
+	e.refreshMu.Lock()
+
+	// Check TTL - skip if recently refreshed
+	if lastRefresh, ok := e.refreshTimes[number]; ok {
+		if time.Since(lastRefresh) < e.refreshTTL {
+			e.refreshMu.Unlock()
+			return
+		}
+	}
+
+	// Check in-flight - skip if already refreshing
+	if e.refreshing[number] {
+		e.refreshMu.Unlock()
+		return
+	}
+
+	// Mark as refreshing and update time immediately
+	// (prevents rapid duplicate triggers)
+	e.refreshing[number] = true
+	e.refreshTimes[number] = time.Now()
+	e.refreshMu.Unlock()
+
+	// Spawn background goroutine
+	go func() {
+		defer func() {
+			e.refreshMu.Lock()
+			delete(e.refreshing, number)
+			e.refreshMu.Unlock()
+		}()
+
+		// Check stopCh before making API call
+		select {
+		case <-e.stopCh:
+			return
+		default:
+		}
+
+		updated, err := e.RefreshIssue(number)
+		if err != nil {
+			logger.Debug("sync: background refresh failed for #%d: %v", number, err)
+		} else if updated {
+			logger.Debug("sync: background refresh updated #%d", number)
+		}
+	}()
 }
 
 // TriggerSync schedules a debounced sync of dirty issues.
